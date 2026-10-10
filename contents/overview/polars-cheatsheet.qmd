@@ -1,0 +1,687 @@
+---
+title: "Polars Cheatsheet for tidyverse Users"
+subtitle: "dplyr · tidyr · stringr · lubridate · forcats · purrr → Python Polars 2.0"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    toc-title: "Sections"
+    grid:
+      body-width: 1050px
+    include-in-header:
+      text: |
+        <style>
+          table { font-size: 0.85rem; }
+          table code { font-size: 0.82rem; white-space: pre-wrap; }
+          td:first-child, th:first-child { width: 40%; }
+        </style>
+---
+
+## Conventions & Translation Rules {#sec-cs-conventions}
+
+All code on this page is **view-only** (not executed). Every Polars snippet
+was checked against Polars 2.0.
+
+```python
+import polars as pl
+import polars.selectors as cs   # tidyselect-style helpers
+```
+
+| Symbol | Meaning |
+|---|---|
+| `df` / `lf` | a `pl.DataFrame` (eager) / a `pl.LazyFrame` (lazy) |
+| `x`, `y`, `g`, `k` | column names (numeric, any, grouping, join key) |
+| `e` | any expression, e.g. `pl.col("x").mean()` |
+| `→` in notes | "becomes" / "returns" |
+
+: {.striped}
+
+```text
+df.group_by("g").agg( pl.col("x").mean().alias("x_mean") )
+└┬┘ └──────┬──────┘   └──────────────────┬───────────────┘
+data     context                     expression
+         (verb)                   (what to compute)
+```
+
+| tidyverse habit | Polars equivalent |
+|---|---|
+| bare column `x` | `pl.col("x")` |
+| `|>` pipe | method chaining, wrapped in `( ... )` |
+| `mutate()` | `with_columns()` |
+| `summarise()` | `group_by().agg()` (grouped) or `select()` (whole frame) |
+| `.by = g` / grouped `mutate()` | `e.over("g")` |
+| `NA` | `None` in Python, displayed as `null` |
+| `TRUE` / `FALSE` | `True` / `False` |
+| `&`, `|`, `!` | `&`, `|`, `~` (always parenthesize comparisons) |
+| `c("a", "b")` | `["a", "b"]` |
+| 1-based indexing | **0-based** indexing |
+| `ungroup()` | not needed: no persistent grouped state |
+
+: {.striped}
+
+## Import, Export & Inspect {#sec-cs-io}
+
+### Read & write
+
+| tidyverse | Polars | Note |
+|---|---|---|
+| `read_csv("f.csv")` | `pl.read_csv("f.csv")` | |
+| `read_csv(na = c("", "NA"))` | `pl.read_csv("f.csv", null_values=["", "NA"])` | |
+| `read_csv(col_types = cols(a = "d"))` | `pl.read_csv("f.csv", schema_overrides={"a": pl.Float64})` | |
+| `read_csv(col_select = c(a, b))` | `pl.read_csv("f.csv", columns=["a", "b"])` | |
+| `read_csv(n_max = 100)` | `pl.read_csv("f.csv", n_rows=100)` | |
+| `read_csv()` auto-parses dates | `pl.read_csv("f.csv", try_parse_dates=True)` | off by default |
+| `read_tsv()` / `read_delim(delim = ";")` | `pl.read_csv("f", separator="\t")` | |
+| `arrow::read_parquet("f.parquet")` | `pl.read_parquet("f.parquet")` | |
+| `readxl::read_excel("f.xlsx", sheet = 1)` | `pl.read_excel("f.xlsx", sheet_name="Sheet1")` | needs `fastexcel` |
+| `arrow::open_dataset("dir/")` | `pl.scan_parquet("dir/**/*.parquet")` | lazy, glob OK |
+| `write_csv(df, "f.csv")` | `df.write_csv("f.csv")` | |
+| `arrow::write_parquet(df, "f.parquet")` | `df.write_parquet("f.parquet")` | |
+| `write_dataset(df, "dir", partitioning = "g")` | `df.write_parquet("dir", partition_by="g")` | Hive-style folders |
+
+: {.striped .hover}
+
+### Create a DataFrame
+
+| tidyverse | Polars |
+|---|---|
+| `tibble(a = 1:3, b = c("x", "y", "z"))` | `pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})` |
+| `tribble(~a, ~b, 1, "x", 2, "y")` | `pl.DataFrame([(1, "x"), (2, "y")], schema=["a", "b"], orient="row")` |
+| fixed column types | `pl.DataFrame({...}, schema={"a": pl.Int32, "b": pl.String})` |
+| from list of records | `pl.from_dicts([{"a": 1}, {"a": 2}])` |
+| from / to pandas | `pl.from_pandas(pdf)` / `df.to_pandas()` (needs `pyarrow`) |
+
+: {.striped .hover}
+
+### Inspect
+
+| tidyverse / base R | Polars |
+|---|---|
+| `df` / `print(df)` | `df` / `print(df)` |
+| `glimpse(df)` | `df.glimpse()` |
+| `nrow(df)` / `ncol(df)` / `dim(df)` | `df.height` / `df.width` / `df.shape` |
+| `names(df)` | `df.columns` |
+| `str(df)` / `sapply(df, class)` | `df.schema` |
+| `summary(df)` | `df.describe()` |
+| `head(df, 10)` / `tail(df, 10)` | `df.head(10)` / `df.tail(10)` |
+| `colSums(is.na(df))` | `df.null_count()` |
+| `slice_sample(n = 5)` | `df.sample(n=5, seed=42)` |
+| `slice_sample(prop = 0.1)` | `df.sample(fraction=0.1, seed=42)` |
+| `lobstr::obj_size(df)` | `df.estimated_size("mb")` |
+| `options(pillar.print_max = 50)` | `pl.Config.set_tbl_rows(50)` |
+
+: {.striped .hover}
+
+## Select Columns {#sec-cs-select}
+
+| dplyr / tidyselect | Polars | Note |
+|---|---|---|
+| `select(x, y)` | `df.select("x", "y")` | |
+| `select(new = x)` | `df.select(new=pl.col("x"))` | |
+| `select(-x, -y)` | `df.drop("x", "y")` | or `df.select(pl.exclude("x", "y"))` |
+| `select(everything())` | `df.select(pl.all())` | |
+| `select(where(is.numeric))` | `df.select(cs.numeric())` | |
+| `select(where(is.character))` | `df.select(cs.string())` | |
+| `select(starts_with("b"))` | `df.select(cs.starts_with("b"))` | |
+| `select(ends_with("_g"))` | `df.select(cs.ends_with("_g"))` | |
+| `select(contains("ill"))` | `df.select(cs.contains("ill"))` | literal substring |
+| `select(matches("^s\\d"))` | `df.select(cs.matches(r"^s\d"))` | regex |
+| `select(all_of(vars))` | `df.select(vars)` | `vars` is a Python list |
+| `select(any_of(vars))` | `df.select(cs.by_name(vars, require_all=False))` | |
+| `select(where(is.numeric) & !starts_with("id"))` | `df.select(cs.numeric() - cs.starts_with("id"))` | selector set ops: `|` `&` `-` `~` |
+| `relocate(x)` | `df.select("x", pl.exclude("x"))` | |
+| `rename(new = old)` | `df.rename({"old": "new"})` | |
+| `rename_with(toupper)` | `df.rename(str.upper)` | any function `str → str` |
+| `rename_with(~ paste0("p_", .x), starts_with("x"))` | `df.rename(lambda c: "p_" + c if c.startswith("x") else c)` | |
+| `pull(x)` | `df["x"]` or `df.get_column("x")` | returns a `pl.Series` |
+| `pull(x)` as plain vector | `df["x"].to_list()` | Python list |
+| single value, e.g. `max(df$x)` | `df.select(pl.col("x").max()).item()` | |
+
+: {.striped .hover}
+
+## Filter Rows {#sec-cs-filter}
+
+| dplyr | Polars | Note |
+|---|---|---|
+| `filter(x > 5)` | `df.filter(pl.col("x") > 5)` | |
+| `filter(x > 5, y == "a")` | `df.filter(pl.col("x") > 5, pl.col("y") == "a")` | comma = AND |
+| `filter(x > 5 | y == "a")` | `df.filter((pl.col("x") > 5) | (pl.col("y") == "a"))` | parentheses required |
+| `filter(!(x > 5))` | `df.filter(~(pl.col("x") > 5))` | |
+| `filter(y %in% c("a", "b"))` | `df.filter(pl.col("y").is_in(["a", "b"]))` | |
+| `filter(!y %in% c("a", "b"))` | `df.filter(~pl.col("y").is_in(["a", "b"]))` | |
+| `filter(between(x, 1, 10))` | `df.filter(pl.col("x").is_between(1, 10))` | inclusive both ends |
+| `filter(is.na(x))` / `filter(!is.na(x))` | `pl.col("x").is_null()` / `pl.col("x").is_not_null()` | |
+| `filter(str_detect(y, "^a"))` | `df.filter(pl.col("y").str.contains("^a"))` | |
+| `filter(if_all(c(a, b), ~ !is.na(.x)))` | `df.filter(pl.all_horizontal(pl.col("a", "b").is_not_null()))` | |
+| `filter(if_any(where(is.numeric), ~ .x > 0))` | `df.filter(pl.any_horizontal(cs.numeric() > 0))` | |
+| `filter(x == max(x), .by = g)` | `df.filter(pl.col("x") == pl.col("x").max().over("g"))` | grouped filter |
+| `filter(n() > 1, .by = g)` | `df.filter(pl.len().over("g") > 1)` | |
+| `distinct()` | `df.unique(maintain_order=True)` | |
+| `distinct(y)` | `df.select("y").unique()` | |
+| `distinct(y, .keep_all = TRUE)` | `df.unique(subset="y", keep="first", maintain_order=True)` | |
+| `filter(duplicated(y))` | `df.filter(~pl.col("y").is_first_distinct())` | 2nd+ occurrences |
+| all rows sharing a duplicated `y` | `df.filter(pl.col("y").is_duplicated())` | marks **every** copy |
+| `slice(2:4)` | `df.slice(1, 3)` | `(offset, length)`, 0-based |
+| `slice_head(n = 5)` / `slice_tail(n = 5)` | `df.head(5)` / `df.tail(5)` | |
+| `slice_head(n = 1, by = g)` | `df.group_by("g", maintain_order=True).head(1)` | |
+| `slice_max(x, n = 3)` / `slice_min(x, n = 3)` | `df.top_k(3, by="x")` / `df.bottom_k(3, by="x")` | |
+| `slice_max(x, n = 1, by = g)` | `df.filter(pl.col("x") == pl.col("x").max().over("g"))` | keeps ties |
+| `drop_na()` / `drop_na(x)` | `df.drop_nulls()` / `df.drop_nulls(subset="x")` | |
+
+: {.striped .hover}
+
+::: {.callout-warning}
+## Operator precedence differs from R
+
+In Python, `|` and `&` bind **tighter** than `>` or `==`.
+`pl.col("x") > 5 | pl.col("y") == "a"` is parsed as `pl.col("x") > (5 | pl.col("y")) == "a"`.
+Always wrap each comparison in parentheses.
+:::
+
+## Create & Modify Columns {#sec-cs-mutate}
+
+### Basics
+
+| dplyr | Polars | Note |
+|---|---|---|
+| `mutate(z = x + y)` | `df.with_columns(z=pl.col("x") + pl.col("y"))` | kwarg = name |
+| `mutate(z = x + y)` | `df.with_columns((pl.col("x") + pl.col("y")).alias("z"))` | `.alias()` = name |
+| `mutate(x = x * 2)` | `df.with_columns(pl.col("x") * 2)` | keeps name `x` |
+| `mutate(src = "lab")` | `df.with_columns(src=pl.lit("lab"))` | constants need `pl.lit()` |
+| `transmute(z = x + y)` | `df.select(z=pl.col("x") + pl.col("y"))` | |
+| `mutate(z = x + 1, w = z * 2)` | `df.with_columns(z=...).with_columns(w=pl.col("z") * 2)` | exprs in one call run in parallel |
+| `rowid_to_column("id")` | `df.with_row_index("id", offset=1)` | default offset is 0 |
+| `x / sum(x)` | `pl.col("x") / pl.col("x").sum()` | |
+| `as.numeric(scale(x))` | `(pl.col("x") - pl.col("x").mean()) / pl.col("x").std()` | |
+| `log(x)`, `sqrt(x)`, `abs(x)`, `exp(x)` | `.log()`, `.sqrt()`, `.abs()`, `.exp()` | |
+| `round(x, 2)` | `pl.col("x").round(2)` | half-to-even, like R |
+| `pmin(x, y)` / `pmax(x, y)` | `pl.min_horizontal("x", "y")` / `pl.max_horizontal("x", "y")` | |
+| `rowSums(pick(a, b))` / `rowMeans(...)` | `pl.sum_horizontal("a", "b")` / `pl.mean_horizontal("a", "b")` | nulls skipped |
+| `coalesce(x, y)` | `pl.coalesce("x", "y")` | |
+| `na_if(y, "")` | `pl.col("y").replace("", None)` | |
+
+: {.striped .hover}
+
+### Conditionals & recoding
+
+| dplyr | Polars |
+|---|---|
+| `if_else(x > 5, "hi", "lo")` | `pl.when(pl.col("x") > 5).then(pl.lit("hi")).otherwise(pl.lit("lo"))` |
+| `case_when(x < 3 ~ "lo", x < 7 ~ "mid", .default = "hi")` | `pl.when(pl.col("x") < 3).then(pl.lit("lo")).when(pl.col("x") < 7).then(pl.lit("mid")).otherwise(pl.lit("hi"))` |
+| `case_match(y, "a" ~ "A", "b" ~ "B", .default = y)` / `recode()` | `pl.col("y").replace({"a": "A", "b": "B"})` (unmatched kept) |
+| `case_match(y, "a" ~ 1, "b" ~ 2)` (unmatched → `NA`) | `pl.col("y").replace_strict({"a": 1, "b": 2}, default=None)` |
+
+: {.striped .hover}
+
+```python
+# Multi-branch case_when, formatted for readability
+df.with_columns(
+    size=pl.when(pl.col("x").is_null()).then(None)       # keep NA as NA
+           .when(pl.col("x") < 3).then(pl.lit("lo"))
+           .when(pl.col("x") < 7).then(pl.lit("mid"))
+           .otherwise(pl.lit("hi"))
+)
+```
+
+::: {.callout-important}
+## Three `when/then` traps
+
+1. A plain string in `then()` / `otherwise()` is read as a **column name**. Use `pl.lit("hi")`.
+2. A **null condition falls through to `otherwise()`**, whereas `if_else(NA, ...)` gives `NA`. Test `is_null()` first.
+3. The output name comes from the **first `then()`** branch. Name it explicitly with a kwarg or `.alias()`.
+:::
+
+### Type conversion
+
+| R | Polars |
+|---|---|
+| `as.numeric(x)` | `pl.col("x").cast(pl.Float64)` |
+| `as.integer(x)` | `pl.col("x").cast(pl.Int64)` |
+| `as.character(x)` | `pl.col("x").cast(pl.String)` |
+| `as.logical(x)` | `pl.col("x").cast(pl.Boolean)` |
+| `as.integer("12")` (parse string) | `pl.col("y").str.to_integer()` |
+| `factor(x)` | `pl.col("y").cast(pl.Categorical)` |
+
+: {.striped .hover}
+
+Common dtypes: `pl.Int64`, `pl.Int32`, `pl.UInt32`, `pl.Float64`, `pl.String`,
+`pl.Boolean`, `pl.Date`, `pl.Datetime`, `pl.Duration`, `pl.Categorical`,
+`pl.Enum([...])`, `pl.List(pl.Int64)`, `pl.Struct`.
+
+### Apply to many columns (`across()`)
+
+| dplyr | Polars |
+|---|---|
+| `mutate(across(where(is.numeric), ~ round(.x, 1)))` | `df.with_columns(cs.numeric().round(1))` |
+| `mutate(across(c(a, b), ~ .x * 2))` | `df.with_columns(pl.col("a", "b") * 2)` |
+| `mutate(across(c(a, b), ~ .x * 2, .names = "{.col}_x2"))` | `df.with_columns((pl.col("a", "b") * 2).name.suffix("_x2"))` |
+| `.names = "log_{.col}"` | `.name.prefix("log_")` |
+| `mutate(across(starts_with("b"), as.character))` | `df.with_columns(cs.starts_with("b").cast(pl.String))` |
+| `summarise(across(where(is.numeric), mean))` | `df.select(cs.numeric().mean())` |
+
+: {.striped .hover}
+
+## Summarise & Group {#sec-cs-summarise}
+
+| dplyr | Polars | Note |
+|---|---|---|
+| `summarise(m = mean(x))` | `df.select(m=pl.col("x").mean())` | no groups → `select` |
+| `group_by(g) |> summarise(m = mean(x))` | `df.group_by("g").agg(m=pl.col("x").mean())` | |
+| `summarise(..., .by = c(g1, g2))` | `df.group_by("g1", "g2").agg(...)` | |
+| group by a computed key | `df.group_by(pl.col("d").dt.year().alias("yr")).agg(...)` | |
+| `n()` | `pl.len()` | |
+| `n_distinct(y)` | `pl.col("y").n_unique()` | |
+| `mean(x, na.rm = TRUE)` | `pl.col("x").mean()` | nulls skipped by default |
+| `sum`, `min`, `max`, `median`, `sd`, `var` | `.sum()`, `.min()`, `.max()`, `.median()`, `.std()`, `.var()` | |
+| `quantile(x, 0.9)` | `pl.col("x").quantile(0.9)` | |
+| `first(x)` / `last(x)` / `nth(x, 2)` | `.first()` / `.last()` / `.get(1)` | `get` is 0-based |
+| `sum(x > 5)` / `mean(x > 5)` | `(pl.col("x") > 5).sum()` / `(pl.col("x") > 5).mean()` | count / proportion |
+| `mean(x[y == "a"])` | `pl.col("x").filter(pl.col("y") == "a").mean()` | |
+| `sum(is.na(x))` | `pl.col("x").null_count()` | |
+| `cor(x, y)` | `pl.corr("x", "y")` | |
+| `weighted.mean(x, w)` | `(pl.col("x") * pl.col("w")).sum() / pl.col("w").sum()` | |
+| `paste(y, collapse = ", ")` | `pl.col("y").str.join(", ")` | |
+| `list(x)` (collect values) | `pl.col("x")` inside `agg()` | un-aggregated → list column |
+| `count(g)` | `df.group_by("g").len(name="n")` | |
+| `count(g, sort = TRUE)` | `df["g"].value_counts(sort=True)` | |
+| `count(g1, g2)` | `df.group_by("g1", "g2").len()` | |
+| `add_count(g)` | `df.with_columns(n=pl.len().over("g"))` | |
+| `mutate(m = mean(x), .by = g)` | `df.with_columns(m=pl.col("x").mean().over("g"))` | rows preserved |
+| `group_split(g)` | `df.partition_by("g")` | `as_dict=True` for a dict |
+
+: {.striped .hover}
+
+```text
+SUMMARISE: group_by("g").agg(...)      MUTATE BY GROUP: with_columns(e.over("g"))
+┌───┬───┐                              ┌───┬───┬──────┐
+│ g │ x │       ┌───┬──────┐           │ g │ x │ mean │
+│ a │ 1 │       │ g │ mean │           │ a │ 1 │ 1.5  │
+│ a │ 2 │  ──►  │ a │ 1.5  │           │ a │ 2 │ 1.5  │
+│ b │ 5 │       │ b │ 5.0  │           │ b │ 5 │ 5.0  │
+└───┴───┘       └───┴──────┘           └───┴───┴──────┘
+                rows collapse          rows preserved (broadcast back)
+```
+
+::: {.callout-note}
+`group_by()` output order is **not** guaranteed. Use
+`group_by("g", maintain_order=True)` or finish with `.sort("g")`.
+:::
+
+## Sort Rows {#sec-cs-sort}
+
+| dplyr | Polars | Note |
+|---|---|---|
+| `arrange(x)` | `df.sort("x")` | |
+| `arrange(desc(x))` | `df.sort("x", descending=True)` | |
+| `arrange(g, desc(x))` | `df.sort("g", "x", descending=[False, True])` | |
+| `arrange(x)` with `NA` last | `df.sort("x", nulls_last=True)` | Polars puts nulls **first** by default |
+| `arrange(str_length(y))` | `df.sort(pl.col("y").str.len_chars())` | sort by expression |
+| reverse row order | `df.reverse()` | |
+
+: {.striped .hover}
+
+## Joins & Binding {#sec-cs-joins}
+
+### Mutating & filtering joins
+
+| dplyr | Polars | Note |
+|---|---|---|
+| `left_join(a, b, by = "k")` | `a.join(b, on="k", how="left")` | |
+| `inner_join(a, b, by = "k")` | `a.join(b, on="k", how="inner")` | `inner` is the default `how` |
+| `right_join(a, b, by = "k")` | `a.join(b, on="k", how="right")` | |
+| `full_join(a, b, by = "k")` | `a.join(b, on="k", how="full", coalesce=True)` | without `coalesce` you get `k` and `k_right` |
+| `semi_join(a, b, by = "k")` | `a.join(b, on="k", how="semi")` | |
+| `anti_join(a, b, by = "k")` | `a.join(b, on="k", how="anti")` | |
+| `cross_join(a, b)` | `a.join(b, how="cross")` | |
+| `by = c("k1", "k2")` | `on=["k1", "k2"]` | |
+| `by = join_by(k == id)` | `left_on="k", right_on="id"` | |
+| `by = join_by(x > lo)` | `a.join_where(b, pl.col("x") > pl.col("lo"))` | inequality join |
+| `by = join_by(closest(t >= t2))` | `a.join_asof(b, left_on="t", right_on="t2")` | both sorted by key |
+| `suffix = c(".x", ".y")` | `suffix="_y"` | only right side is suffixed |
+| `relationship = "many-to-one"` | `validate="m:1"` | also `"1:1"`, `"1:m"` |
+| `na_matches = "na"` (dplyr default) | `nulls_equal=True` | nulls **never** match by default |
+| keep row order of `a` | `maintain_order="left"` | not guaranteed in 2.0 otherwise |
+
+: {.striped .hover}
+
+### Binding & set operations
+
+| dplyr | Polars | Note |
+|---|---|---|
+| `bind_rows(a, b)` | `pl.concat([a, b])` | identical schemas |
+| `bind_rows(a, b)` (different columns) | `pl.concat([a, b], how="diagonal")` | missing → null |
+| `bind_cols(a, b)` | `pl.concat([a, b], how="horizontal")` | |
+| `union(a, b)` | `pl.concat([a, b]).unique()` | |
+| `intersect(a, b)` | `a.join(b, on=a.columns, how="semi")` | |
+| `setdiff(a, b)` | `a.join(b, on=a.columns, how="anti")` | |
+
+: {.striped .hover}
+
+```python
+# bind_rows(.id = "source")
+pl.concat([
+    a.with_columns(source=pl.lit("a")),
+    b.with_columns(source=pl.lit("b")),
+])
+```
+
+## Reshape (tidyr) {#sec-cs-reshape}
+
+| tidyr | Polars | Note |
+|---|---|---|
+| `pivot_longer(c(a, b), names_to = "var", values_to = "val")` | `df.unpivot(on=["a", "b"], index="id", variable_name="var", value_name="val")` | `index` = columns kept |
+| `pivot_longer(-id)` | `df.unpivot(index="id")` | everything else → rows |
+| `pivot_longer(where(is.numeric))` | `df.unpivot(on=cs.numeric(), index="id")` | |
+| `pivot_wider(names_from = var, values_from = val)` | `df.pivot(on="var", index="id", values="val")` | |
+| `pivot_wider(..., values_fn = mean)` | `df.pivot(..., aggregate_function="mean")` | `"sum"`, `"len"`, `"first"`... |
+| `pivot_wider(..., values_fill = 0)` | `df.pivot(...).fill_null(0)` | |
+| `pivot_wider()` on a lazy table | `lf.pivot(on="var", on_columns=["a", "b"], index="id", values="val")` | lazy needs the new columns listed |
+| `separate_wider_delim(y, "_", names = c("a", "b"))` | `df.with_columns(pl.col("y").str.split_exact("_", 1).struct.rename_fields(["a", "b"])).unnest("y")` | `split_exact(sep, n_splits)` |
+| `separate_wider_regex(y, c(a = "[A-Z]", "_", b = "\\d+"))` | `df.with_columns(pl.col("y").str.extract_groups(r"(?<a>[A-Z])_(?<b>\d+)")).unnest("y")` | named groups → fields |
+| `separate_longer_delim(y, ",")` | `df.with_columns(pl.col("y").str.split(",")).explode("y")` | |
+| `unite(z, a, b, sep = "_")` | `df.with_columns(z=pl.concat_str("a", "b", separator="_"))` | |
+| `unnest_longer(lst)` | `df.explode("lst")` | |
+| `unnest_wider(s)` | `df.unnest("s")` | for struct columns |
+| `nest(.by = g)` | `df.group_by("g").agg(pl.all())` | one list column per column |
+| `fill(x, .direction = "down")` | `pl.col("x").fill_null(strategy="forward")` | `"backward"` = up |
+| `expand_grid(a = ..., b = ...)` | `A.join(B, how="cross")` | |
+| `t(df)` | `df.transpose()` | |
+
+: {.striped .hover}
+
+```python
+# complete(a, b): all combinations, missing ones filled with null
+(
+    df.select("a").unique()
+    .join(df.select("b").unique(), how="cross")
+    .join(df, on=["a", "b"], how="left")
+)
+```
+
+## Missing Values {#sec-cs-missing}
+
+| tidyverse | Polars | Note |
+|---|---|---|
+| `NA` | `None` (Python) → shown as `null` | |
+| `is.na(x)` / `!is.na(x)` | `.is_null()` / `.is_not_null()` | |
+| `replace_na(x, 0)` | `pl.col("x").fill_null(0)` | |
+| `replace_na()` on all numeric | `df.with_columns(cs.numeric().fill_null(0))` | |
+| fill with mean | `pl.col("x").fill_null(pl.col("x").mean())` | |
+| fill with group mean | `pl.col("x").fill_null(pl.col("x").mean().over("g"))` | |
+| `fill(x)` | `pl.col("x").fill_null(strategy="forward")` | |
+| `na_if(y, "")` | `pl.col("y").replace("", None)` | |
+| `colSums(is.na(df))` | `df.null_count()` | |
+| `is.nan(x)` | `pl.col("x").is_nan()` | `NaN` is **not** null |
+| `NaN` → `NA` | `pl.col("x").fill_nan(None)` | then null tools apply |
+| `mean(x)` with `NA` → `NA` | `pl.col("x").mean()` → ignores nulls | no `na.rm` needed |
+
+: {.striped .hover}
+
+## Strings (stringr) {#sec-cs-strings}
+
+All under the `.str` namespace, e.g. `pl.col("y").str.to_uppercase()`.
+
+| stringr | Polars `.str.` | Note |
+|---|---|---|
+| `str_length(y)` | `.len_chars()` | |
+| `str_to_upper()` / `str_to_lower()` / `str_to_title()` | `.to_uppercase()` / `.to_lowercase()` / `.to_titlecase()` | |
+| `str_trim(y)` | `.strip_chars()` | |
+| `str_squish(y)` | `.strip_chars().str.replace_all(r"\s+", " ")` | |
+| `str_remove(y, "^0+")` | `.strip_chars_start("0")` | |
+| `str_detect(y, "pat")` | `.contains("pat")` | regex |
+| `str_detect(y, fixed("."))` | `.contains(".", literal=True)` | |
+| `str_detect(y, regex("pat", ignore_case = TRUE))` | `.contains("(?i)pat")` | |
+| `str_starts(y, "A")` / `str_ends(y, "z")` | `.starts_with("A")` / `.ends_with("z")` | literal |
+| `str_replace(y, "a", "b")` | `.replace("a", "b")` | first match |
+| `str_replace_all(y, "a", "b")` | `.replace_all("a", "b")` | |
+| `str_remove_all(y, "\\d")` | `.replace_all(r"\d", "")` | |
+| `str_sub(y, 1, 3)` | `.slice(0, 3)` | `(offset, length)`, 0-based |
+| `str_sub(y, 1, 2)` / `str_sub(y, -2)` | `.head(2)` / `.tail(2)` | |
+| `str_extract(y, "\\d+")` | `.extract(r"(\d+)", 1)` | needs a capture group |
+| `str_extract_all(y, "\\d+")` | `.extract_all(r"\d+")` | list column |
+| `str_count(y, "\\d")` | `.count_matches(r"\d")` | |
+| `str_split(y, ",")` | `.split(",")` | list column |
+| `str_pad(y, 5, pad = "0")` | `.pad_start(5, "0")` or `.zfill(5)` | `pad_end` for right |
+| `str_c(a, b, sep = " ")` / `paste(a, b)` | `pl.concat_str("a", "b", separator=" ")` | top-level function |
+| `str_glue("{a} ({b})")` | `pl.format("{} ({})", "a", "b")` | top-level function |
+| `str_c(y, collapse = ",")` | `.join(",")` | aggregates to one string |
+| `str_rev(y)` | `.reverse()` | |
+| `as.numeric(y)` | `.to_integer()` or `pl.col("y").cast(pl.Float64)` | |
+
+: {.striped .hover}
+
+::: {.callout-tip}
+Write regex as Python **raw strings** (`r"\d+"`) to avoid double escaping.
+Polars uses the Rust `regex` engine: no look-arounds or back-references.
+:::
+
+## Dates & Times (lubridate) {#sec-cs-datetime}
+
+All under the `.dt` namespace (parsing lives in `.str`).
+
+| lubridate | Polars | Note |
+|---|---|---|
+| `ymd(y)` | `pl.col("y").str.to_date("%Y-%m-%d")` | |
+| `dmy(y)` | `pl.col("y").str.to_date("%d/%m/%Y")` | |
+| `ymd_hms(y)` | `pl.col("y").str.to_datetime("%Y-%m-%d %H:%M:%S")` | |
+| `as_date(dttm)` | `pl.col("t").dt.date()` | |
+| `ymd("2025-02-01")` as literal | `pl.date(2025, 2, 1)` or `datetime.date(2025, 2, 1)` | |
+| `year()`, `month()`, `day()` | `.dt.year()`, `.dt.month()`, `.dt.day()` | |
+| `hour()`, `minute()`, `second()` | `.dt.hour()`, `.dt.minute()`, `.dt.second()` | |
+| `wday(d, week_start = 1)` | `.dt.weekday()` | Mon = 1 … Sun = 7 |
+| `yday(d)` / `isoweek(d)` / `quarter(d)` | `.dt.ordinal_day()` / `.dt.week()` / `.dt.quarter()` | |
+| `floor_date(d, "month")` | `.dt.truncate("1mo")` | any interval: `"1w"`, `"1h"`... |
+| first / last day of month | `.dt.month_start()` / `.dt.month_end()` | |
+| `d + days(7)` | `pl.col("d") + pl.duration(days=7)` | |
+| `d %m+% months(1)` | `.dt.offset_by("1mo")` | calendar-aware |
+| `as.numeric(d2 - d1, units = "days")` | `(pl.col("d2") - pl.col("d1")).dt.total_days()` | also `total_hours()`... |
+| `format(d, "%d/%m/%Y")` | `.dt.strftime("%d/%m/%Y")` | |
+| `seq(d1, d2, by = "day")` | `pl.date_range(d1, d2, "1d", eager=True)` | `pl.datetime_range` for datetimes |
+| `force_tz(t, "Asia/Bangkok")` | `.dt.replace_time_zone("Asia/Bangkok")` | relabel |
+| `with_tz(t, "Asia/Bangkok")` | `.dt.convert_time_zone("Asia/Bangkok")` | convert |
+| `group_by(m = floor_date(d, "month"))` | `df.group_by(pl.col("d").dt.truncate("1mo")).agg(...)` | |
+| calendar-window grouping | `df.sort("d").group_by_dynamic("d", every="1mo").agg(...)` | needs sorted key |
+
+: {.striped .hover}
+
+```text
+Polars interval strings
+  1ns  1us  1ms  1s   1m   1h   1d   1w   1mo  1q   1y
+                      ▲                    ▲
+                   MINUTE               MONTH      ← "1m" is NOT a month!
+Combine freely: "1h30m", "2w", "3mo"
+```
+
+## Factors (forcats) & Binning {#sec-cs-factors}
+
+| forcats / base R | Polars | Note |
+|---|---|---|
+| `factor(y)` | `pl.col("y").cast(pl.Categorical)` | levels inferred |
+| `factor(y, levels = c("lo", "mid", "hi"))` | `pl.col("y").cast(pl.Enum(["lo", "mid", "hi"]))` | fixed order; sorting follows it |
+| `levels(f)` (Enum) | `df.schema["y"].categories` | |
+| distinct values of a factor | `df.select(pl.col("y").unique())` | `cat.get_categories()` removed in 2.0 |
+| `as.integer(f)` | `pl.col("y").to_physical()` | 0-based codes |
+| `fct_recode(f, A = "a")` | `pl.col("y").replace({"a": "A"})` | then re-cast if needed |
+| `cut(x, c(-Inf, 40, 47, Inf), labels = ...)` | `pl.col("x").bin_intervals([40, 47], labels=["s", "m", "l"])` | replaces `cut()` in 2.0 |
+| `ntile(x, 4)` | `pl.col("x").bin_ranks(4, labels=False) + 1` | `bin_ranks` is 0-based |
+| quantile-based bins | `pl.col("x").bin_quantiles(4, labels=False)` | replaces `qcut()` in 2.0 |
+
+: {.striped .hover}
+
+::: {.callout-note}
+The `bin_*` functions are marked **experimental** in Polars 2.0.
+:::
+
+## Window & Ranking Functions {#sec-cs-window}
+
+Append `.over("g")` to any row of this table to make it per-group.
+
+| dplyr | Polars | Note |
+|---|---|---|
+| `lag(x)` / `lead(x)` | `pl.col("x").shift(1)` / `pl.col("x").shift(-1)` | |
+| `lag(x, 2, default = 0)` | `pl.col("x").shift(2, fill_value=0)` | |
+| `x - lag(x)` | `pl.col("x").diff()` | |
+| `(x - lag(x)) / lag(x)` | `pl.col("x").pct_change()` | |
+| `cumsum(x)` / `cummax(x)` / `cummin(x)` | `.cum_sum()` / `.cum_max()` / `.cum_min()` | |
+| `cummean(x)` | `pl.col("x").cum_sum() / pl.int_range(1, pl.len() + 1)` | no `cum_mean()` |
+| `row_number()` | `pl.int_range(1, pl.len() + 1)` | |
+| `row_number(x)` | `pl.col("x").rank("ordinal")` | |
+| `min_rank(x)` / `dense_rank(x)` | `.rank("min")` / `.rank("dense")` | |
+| `min_rank(desc(x))` | `pl.col("x").rank("min", descending=True)` | |
+| `percent_rank(x)` | `(pl.col("x").rank("min") - 1) / (pl.col("x").count() - 1)` | `count()` skips nulls, like dplyr |
+| `cume_dist(x)` | `pl.col("x").rank("max") / pl.col("x").count()` | |
+| `zoo::rollmeanr(x, 3, fill = NA)` | `pl.col("x").rolling_mean(window_size=3)` | also `rolling_sum`, `_max`, `_std`... |
+| time-based rolling window | `pl.col("x").rolling_mean_by("d", window_size="30d")` | |
+| `mutate(cs = cumsum(x), .by = g)` after `arrange(t)` | `pl.col("x").cum_sum().over("g", order_by="t")` | order inside the window |
+
+: {.striped .hover}
+
+## List Columns & Structs (purrr-ish) {#sec-cs-nested}
+
+| purrr / tidyr | Polars | Note |
+|---|---|---|
+| `map_int(lst, length)` | `pl.col("lst").list.len()` | |
+| `map_dbl(lst, mean)` | `pl.col("lst").list.mean()` | also `.list.sum()`, `.list.max()`... |
+| `map(lst, ~ .x * 2)` | `pl.col("lst").list.eval(pl.element() * 2)` | `pl.element()` ≈ `.x` |
+| `map(lst, ~ keep(.x, .x > 0))` | `pl.col("lst").list.filter(pl.element() > 0)` | |
+| `map(lst, 1)` / `pluck(lst, 1)` | `.list.first()` / `.list.get(0)` | 0-based |
+| `map_lgl(lst, ~ v %in% .x)` | `pl.col("lst").list.contains(v)` | |
+| `map_chr(lst, paste, collapse = ",")` | `pl.col("lst").list.join(",")` | string lists |
+| `map(lst, sort)` / `map(lst, unique)` | `.list.sort()` / `.list.unique()` | |
+| pack columns into one | `pl.struct("a", "b").alias("s")` | like a nested tibble row |
+| `s$a` | `pl.col("s").struct.field("a")` | |
+| `unnest_wider(s)` / `unnest_longer(lst)` | `df.unnest("s")` / `df.explode("lst")` | |
+
+: {.striped .hover}
+
+### Custom functions (last resort)
+
+| R | Polars | Note |
+|---|---|---|
+| `map_dbl(x, f)` (element-wise) | `pl.col("x").map_elements(f, return_dtype=pl.Float64)` | slow: runs Python per value |
+| vectorized `f(x)` | `pl.col("x").map_batches(f, return_dtype=pl.Float64)` | `f` gets a whole `pl.Series` |
+| `pmap()` / `rowwise()` | `df.iter_rows(named=True)` | slow; prefer native expressions |
+
+: {.striped .hover}
+
+## Lazy API {#sec-cs-lazy}
+
+| dbplyr / arrow | Polars | Note |
+|---|---|---|
+| `tbl(con, "t")` / `open_dataset()` | `pl.scan_parquet(...)`, `pl.scan_csv(...)` | builds a plan, reads nothing |
+| `as_arrow_table()` / `lazy_dt()` | `df.lazy()` | eager → lazy |
+| `collect()` | `lf.collect()` | runs the optimized plan |
+| `show_query()` | `print(lf.explain())` | optimized plan |
+| `head(n) |> collect()` | `lf.head(5).collect()` | quick preview |
+| `colnames(lazy_tbl)` | `lf.collect_schema().names()` | no data read |
+| `write_dataset()` | `lf.sink_parquet("out.parquet")` | streams to disk, also `sink_csv` |
+
+: {.striped .hover}
+
+```python
+result = (
+    pl.scan_parquet("data/*.parquet")        # 1. scan (lazy)
+    .filter(pl.col("year") == 2025)          # 2. build the plan
+    .group_by("site")
+    .agg(n=pl.len(), avg=pl.col("x").mean())
+    .sort("n", descending=True)
+    .collect()                               # 3. execute
+)
+```
+
+::: {.callout-note}
+## Engines in Polars 2.0
+
+`.collect()` defaults to the **streaming** engine (batch-wise, low memory).
+Force the classic engine with `lf.collect(engine="in-memory")`.
+Streaming does not guarantee row order for joins, `group_by`, or `unpivot`,
+so sort explicitly or use `maintain_order` when order matters.
+:::
+
+## Programming with Polars (tidy eval equivalents) {#sec-cs-programming}
+
+No tidy eval is needed: column names are just strings, and expressions are
+ordinary Python objects you can pass around and return from functions.
+
+| rlang / tidy eval | Polars |
+|---|---|
+| `{{ col }}` / `.data[[var]]` | `pl.col(var)` where `var` is a string |
+| `all_of(vars)` / `!!!syms(vars)` | `pl.col(vars)` where `vars` is a list |
+| `"{name}" := expr` | `expr.alias(name)` or `**{name: expr}` |
+| function returning a quosure | function returning a `pl.Expr` |
+| `df |> my_fun(arg)` | `df.pipe(my_fun, arg)` |
+
+: {.striped .hover}
+
+**R:**
+
+```r
+add_zscore <- function(df, col) {
+  df |> mutate("{{ col }}_z" := ({{ col }} - mean({{ col }})) / sd({{ col }}))
+}
+df |> add_zscore(x)
+```
+
+**Polars:**
+
+```python
+def zscore(col: str) -> pl.Expr:
+    """Reusable expression: a plain function, no quoting needed."""
+    c = pl.col(col)
+    return ((c - c.mean()) / c.std()).alias(f"{col}_z")
+
+def clean_names(df: pl.DataFrame) -> pl.DataFrame:
+    """janitor::clean_names() lite."""
+    return df.rename(lambda c: c.strip().lower().replace(" ", "_"))
+
+(
+    df
+    .pipe(clean_names)
+    .with_columns(zscore("x"), zscore("y"))
+)
+```
+
+## SQL & Interop {#sec-cs-sql}
+
+| Task | Polars |
+|---|---|
+| SQL on one frame | `df.sql("SELECT g, AVG(x) AS m FROM self GROUP BY g")` |
+| SQL across frames | `pl.SQLContext(a=df1, b=df2).execute("SELECT ...", eager=True)` |
+| column → Python list | `df["x"].to_list()` |
+| rows → list of dicts | `df.to_dicts()` |
+| columns → dict of lists | `df.to_dict(as_series=False)` |
+| one row as dict | `df.row(0, named=True)` |
+| → NumPy matrix | `df.select(cs.numeric()).to_numpy()` |
+| ↔ pandas | `df.to_pandas()` / `pl.from_pandas(pdf)` |
+| compare frames | `df1.equals(df2)` |
+
+: {.striped .hover}
+
+## Gotchas at a Glance {#sec-cs-gotchas}
+
+| tidyverse behavior | Polars behavior | Fix |
+|---|---|---|
+| `mutate()` arguments are sequential | `with_columns()` expressions run in parallel | chain `.with_columns()` calls |
+| a bare string is a value | in `then()`, `otherwise()`, `pl.coalesce()`... a string is a **column name** | `pl.lit("text")` |
+| `if_else(NA, ...)` → `NA` | null condition → `otherwise()` branch | test `.is_null()` first |
+| `x > 5 | y == "a"` works | `|` binds tighter than `>` | parenthesize each comparison |
+| `arrange()` puts `NA` last | `sort()` puts nulls **first** | `nulls_last=True` |
+| joins match `NA` to `NA` | nulls never match | `nulls_equal=True` |
+| you choose the join type by name | `join()` defaults to **inner** | always pass `how=` |
+| grouped output is sorted by group | `group_by` order is arbitrary | `maintain_order=True` or `.sort()` |
+| left join keeps left row order | not guaranteed under streaming (2.0) | `maintain_order="left"` |
+| `mean(x)` with `NA` → `NA` | nulls are skipped | (usually what you want) |
+| `duplicated()` flags later copies | `is_duplicated()` flags **all** copies | `~is_first_distinct()` |
+| 1-based indexing | 0-based (`slice`, `str.slice`, `list.get`, `to_physical`) | subtract 1 |
+| `months(1)` / `"1 month"` | `"1m"` = 1 **minute** | `"1mo"` |
+| implicit type coercion | strict dtypes, errors on mismatch | `.cast()` explicitly |
+| `rowwise()` + function | `map_elements()` is slow | find a native expression |
+
+: {.striped .hover}
+
+## Resources
+
+- Polars user guide: <https://docs.pola.rs>
+- Python API reference: <https://docs.pola.rs/api/python/stable/reference/>
+- Polars 2.0 upgrade guide: <https://docs.pola.rs/releases/upgrade/2/>
+- Selectors reference: <https://docs.pola.rs/api/python/stable/reference/selectors.html>

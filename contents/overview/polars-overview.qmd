@@ -1,0 +1,429 @@
+---
+title: "Python Polars: An Overview for tidyverse Users"
+subtitle: "Core concepts, the dplyr ↔ Polars Rosetta Stone, and common gotchas"
+jupyter: python3
+---
+
+## Introduction
+
+**Polars** is a DataFrame library for Python, written in Rust. Coming from the
+tidyverse, you will find it very familiar in spirit: it is the closest thing
+Python has to dplyr's *"verbs + column expressions"* style, but it runs on a
+multi-threaded, query-optimizing engine.
+
+::: {.callout-note}
+## Version
+
+This document targets **Polars 2.0**. The query syntax is the same as the 1.x
+series; the major changes in 2.0 are about *defaults* (most importantly, the
+lazy API now runs on the streaming engine, see @sec-ov-lazy and @sec-ov-gotchas).
+Older tutorials may still use pre-1.0 names such as `groupby` or `melt`,
+which no longer exist.
+:::
+
+```{python}
+import polars as pl
+pl.__version__
+```
+
+## The Core Mental Model
+
+Polars has only three ideas you need to internalize:
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│  1. DATA        pl.DataFrame  (eager)   /  pl.LazyFrame (lazy)   │
+│                                                                  │
+│  2. EXPRESSIONS "recipes" for computing a column                 │
+│                 pl.col("mass_g").mean().alias("avg_mass")        │
+│                 ≈ tidy-eval: an unevaluated column computation   │
+│                                                                  │
+│  3. CONTEXTS    the verbs that EVALUATE expressions              │
+│                 select · with_columns · filter · group_by().agg  │
+└──────────────────────────────────────────────────────────────────┘
+
+        Context (verb)                Expression (what to compute)
+   ┌────────────────────┐        ┌───────────────────────────────┐
+   │ df.with_columns(   │ ◄───── │ (pl.col("mass_g") / 1000)     │
+   │                    │        │     .alias("mass_kg")         │
+   │ )                  │        └───────────────────────────────┘
+   └────────────────────┘
+```
+
+In dplyr, `mutate(mass_kg = mass_g / 1000)` uses **non-standard evaluation**
+(NSE), so you can write bare column names. Python has no NSE, so Polars makes
+the column reference explicit with `pl.col("mass_g")`.
+
+::: {.callout-tip}
+## The one-line translation rule
+
+`pl.col("x")` in Polars is the bare `x` in dplyr. Once that clicks, most
+dplyr code translates almost mechanically.
+:::
+
+## Setup and a Toy Dataset
+
+```{python}
+import polars as pl
+import polars.selectors as cs   # like tidyselect helpers
+
+df = pl.DataFrame({
+    "species": ["Adelie", "Adelie", "Gentoo", "Gentoo", "Chinstrap"],
+    "island":  ["Torgersen", "Biscoe", "Biscoe", "Biscoe", "Dream"],
+    "bill_mm": [39.1, 37.8, 46.1, 50.0, 46.5],
+    "mass_g":  [3750, 3400, 4500, 5700, None],
+})
+
+df   # prints like a tibble: shape + dtypes are shown
+```
+
+`glimpse()` works exactly like `dplyr::glimpse()`:
+
+```{python}
+df.glimpse()
+```
+
+## The Rosetta Stone: dplyr ↔ Polars
+
+| tidyverse | Polars |
+|---|---|
+| `select(species, bill_mm)` | `df.select("species", "bill_mm")` |
+| `select(where(is.numeric))` | `df.select(cs.numeric())` |
+| `select(starts_with("b"))` | `df.select(cs.starts_with("b"))` |
+| `filter(mass_g > 4000)` | `df.filter(pl.col("mass_g") > 4000)` |
+| `mutate(kg = mass_g / 1000)` | `df.with_columns((pl.col("mass_g") / 1000).alias("kg"))` |
+| `rename(new = old)` | `df.rename({"old": "new"})` |
+| `arrange(desc(mass_g))` | `df.sort("mass_g", descending=True)` |
+| `group_by(x) |> summarise(...)` | `df.group_by("x").agg(...)` |
+| `group_by(x) |> mutate(...)` | `df.with_columns(expr.over("x"))` |
+| `n()` | `pl.len()` |
+| `distinct()` | `df.unique()` |
+| `slice_head(n = 3)` | `df.head(3)` |
+| `case_when()` / `if_else()` | `pl.when().then().otherwise()` |
+| `left_join(y, by = "k")` | `df.join(y, on="k", how="left")` |
+| `anti_join()` / `semi_join()` | `how="anti"` / `how="semi"` |
+| `pivot_wider()` | `df.pivot(on=..., index=..., values=...)` |
+| `pivot_longer()` | `df.unpivot(index=..., on=...)` |
+| `drop_na()` / `replace_na()` | `df.drop_nulls()` / `.fill_null(...)` |
+| `str_detect()` / `str_to_upper()` | `.str.contains()` / `.str.to_uppercase()` |
+| `lubridate::year()` | `.dt.year()` |
+| `|>` pipe | method chaining (wrapped in parentheses) |
+
+: Common tidyverse verbs and their Polars equivalents {.striped .hover}
+
+### Quick examples
+
+```{python}
+# select() with tidyselect-style helpers
+df.select(cs.numeric())
+```
+
+```{python}
+# filter() with multiple conditions: comma = AND, just like dplyr
+df.filter(
+    pl.col("island") == "Biscoe",
+    pl.col("mass_g") > 4000,
+)
+```
+
+```{python}
+# arrange(desc(mass_g)), with missing values placed last
+df.sort("mass_g", descending=True, nulls_last=True)
+```
+
+## A Full Pipeline, Side by Side
+
+**dplyr:**
+
+```r
+penguins |>
+  filter(!is.na(mass_g)) |>
+  mutate(mass_kg = mass_g / 1000,
+         size = if_else(mass_g > 4000, "big", "small")) |>
+  group_by(species) |>
+  summarise(n = n(),
+            mean_bill = mean(bill_mm),
+            max_kg = max(mass_kg)) |>
+  arrange(desc(mean_bill))
+```
+
+**Polars:**
+
+```{python}
+result = (
+    df
+    .filter(pl.col("mass_g").is_not_null())
+    .with_columns(
+        mass_kg = pl.col("mass_g") / 1000,          # kwarg style = alias
+        size = pl.when(pl.col("mass_g") > 4000)
+                 .then(pl.lit("big"))
+                 .otherwise(pl.lit("small")),
+    )
+    .group_by("species")
+    .agg(
+        pl.len().alias("n"),
+        pl.col("bill_mm").mean().alias("mean_bill"),
+        pl.col("mass_kg").max().alias("max_kg"),
+    )
+    .sort("mean_bill", descending=True)
+)
+
+result
+```
+
+The outer parentheses let you break the chain across lines. This is the
+Polars equivalent of writing a `|>` pipeline.
+
+## Expressions: Where the Real Power Is
+
+An expression is a chain of operations on a column. It does nothing until a
+context runs it:
+
+```text
+pl.col("bill_mm") ──► .fill_null(0) ──► .mean() ──► .round(1) ──► .alias("avg")
+    (source)          (transform)      (aggregate)  (transform)    (name it)
+```
+
+```{python}
+df.select(
+    pl.col("bill_mm").fill_null(0).mean().round(1).alias("avg")
+)
+```
+
+### Namespaces
+
+Related functions are grouped into namespaces, similar to how stringr,
+lubridate and purrr are organized in the tidyverse:
+
+```{python}
+#| eval: false
+pl.col("species").str.to_lowercase()     # .str  ≈ stringr
+pl.col("date").dt.month()                # .dt   ≈ lubridate
+pl.col("tags").list.len()                # .list ≈ list-columns / purrr
+pl.col("species").cast(pl.Categorical)   # ≈ as.factor()
+```
+
+```{python}
+df.select(
+    pl.col("species"),
+    pl.col("species").str.to_uppercase().alias("upper"),
+    pl.col("island").str.contains("^B").alias("starts_with_B"),
+)
+```
+
+### One expression, many columns (replacing `across()`)
+
+```{python}
+# mutate(across(where(is.numeric), ~ .x * 2))
+df.with_columns(cs.numeric() * 2)
+```
+
+```{python}
+# summarise(across(c(bill_mm, mass_g), mean, .names = "{.col}_mean"))
+df.group_by("species").agg(
+    pl.col("bill_mm", "mass_g").mean().name.suffix("_mean")
+).sort("species")
+```
+
+### Window functions with `.over()` (replacing grouped `mutate()`)
+
+```{python}
+# group_by(species) |> mutate(bill_vs_species = bill_mm - mean(bill_mm))
+df.with_columns(
+    bill_vs_species = pl.col("bill_mm") - pl.col("bill_mm").mean().over("species")
+)
+```
+
+## Eager vs Lazy: The Big Performance Idea {#sec-ov-lazy}
+
+This concept has no direct base-dplyr equivalent, but it works just like
+**dbplyr** and **duckplyr**: you describe the query first, then execute it.
+
+```text
+EAGER  (pl.DataFrame)                 LAZY  (pl.LazyFrame)
+───────────────────────               ─────────────────────────────────
+read_csv()  → executes now            scan_csv()  → builds a plan only
+.filter()   → executes now            .filter()   → adds to plan
+.group_by() → executes now            .group_by() → adds to plan
+                                      .collect()  → optimize + execute ✓
+
+                                      The optimizer can:
+                                        • push filters down into the file read
+                                        • read only the needed columns
+                                        • stream data in batches (> RAM)
+```
+
+A typical lazy pipeline over a file (not run here, since the file does not exist):
+
+```{python}
+#| eval: false
+lazy_result = (
+    pl.scan_parquet("big_data.parquet")     # nothing loaded yet
+    .filter(pl.col("year") == 2025)
+    .group_by("site")
+    .agg(pl.len())
+)
+
+print(lazy_result.explain())   # inspect the optimized plan (≈ show_query())
+df_out = lazy_result.collect() # execute (≈ collect() in dbplyr)
+```
+
+Any eager DataFrame can be switched to lazy mode with `.lazy()`:
+
+```{python}
+lf = (
+    df.lazy()
+    .filter(pl.col("mass_g").is_not_null())
+    .select("species", "mass_g")
+)
+
+print(lf.explain())   # the query plan, before anything runs
+```
+
+Notice `PROJECT 2/4 COLUMNS` in the plan: the optimizer noticed that only two
+columns are needed and will read just those (**projection pushdown**). On a
+Parquet file with hundreds of columns, that saving is substantial.
+
+```{python}
+lf.collect()
+```
+
+::: {.callout-tip}
+## Rule of thumb
+
+Use **eager** mode for interactive exploration of small data. Use **lazy**
+mode (`scan_*()` + `.collect()`) for scripts, pipelines, and anything large.
+Since Polars 2.0, `.collect()` runs on the **streaming engine** by default,
+which processes data in batches and is typically faster and more memory
+efficient.
+:::
+
+## Gotchas for tidyverse Users {#sec-ov-gotchas}
+
+### Columns in the same `with_columns()` can't see each other
+
+In `mutate(a = x + 1, b = a * 2)`, dplyr evaluates arguments sequentially.
+Polars runs all expressions in one context **in parallel**, so `b` cannot
+reference the brand-new `a`:
+
+```{python}
+#| error: true
+df.with_columns(
+    bill_cm = pl.col("bill_mm") / 10,
+    bill_cm_x2 = pl.col("bill_cm") * 2,   # bill_cm doesn't exist yet!
+)
+```
+
+Fix it by chaining two `with_columns()` calls:
+
+```{python}
+(
+    df
+    .with_columns(bill_cm = pl.col("bill_mm") / 10)
+    .with_columns(bill_cm_x2 = pl.col("bill_cm") * 2)
+)
+```
+
+### Strings in `then()` / `otherwise()` mean *column names*
+
+`.then("big")` looks for a **column** named `big`. Use `pl.lit("big")` for a
+literal value:
+
+```{python}
+#| error: true
+df.with_columns(
+    size = pl.when(pl.col("mass_g") > 4000).then("big").otherwise("small")
+)
+```
+
+```{python}
+df.with_columns(
+    size = pl.when(pl.col("mass_g") > 4000)
+             .then(pl.lit("big"))
+             .otherwise(pl.lit("small"))
+)
+```
+
+::: {.callout-important}
+## Null conditions fall through to `otherwise()`
+
+Look at the Chinstrap row above: its `mass_g` is null, yet it got `"small"`.
+`pl.when()` treats a null condition as *false*, so the row falls through to
+`otherwise()`. dplyr's `if_else()` would return `NA` here. If you want the
+missing value preserved, handle it explicitly:
+
+```{python}
+df.with_columns(
+    size = pl.when(pl.col("mass_g").is_null()).then(None)
+             .when(pl.col("mass_g") > 4000).then(pl.lit("big"))
+             .otherwise(pl.lit("small"))
+)
+```
+:::
+
+### Row order is not guaranteed unless you ask for it
+
+`group_by()` output order has never been guaranteed. Since Polars 2.0 (with
+the streaming engine as default), **joins and `unpivot()` may also return
+rows in a different order** than the input. If order matters, say so
+explicitly:
+
+```{python}
+#| eval: false
+df.group_by("species", maintain_order=True).agg(...)   # keep first-seen order
+df.join(other, on="k", how="left", maintain_order="left")  # keep left order
+df.group_by("species").agg(...).sort("species")        # or just sort
+```
+
+::: {.callout-warning}
+This change does **not** raise an error. A pipeline that silently relied on
+incidental row order (e.g. "left table order survives a left join") can
+produce differently ordered output after upgrading to 2.0.
+:::
+
+### `null` ≠ `NaN`
+
+`null` is R's `NA` (a missing value). `NaN` is a floating-point
+*not-a-number*. `drop_nulls()` does not remove `NaN`; use `fill_nan()` or
+`is_nan()` for those.
+
+```{python}
+x = pl.DataFrame({"v": [1.0, None, float("nan")]})
+x.with_columns(
+    is_null = pl.col("v").is_null(),
+    is_nan  = pl.col("v").is_nan(),
+)
+```
+
+### Strict types, no silent coercion
+
+Joining an `Int64` key to a `String` key raises an error instead of guessing.
+Use `.cast()` explicitly. This feels annoying at first, but it catches bugs
+early.
+
+### No row names / index
+
+Unlike pandas, Polars has no index. Good news: tibbles don't have row names
+either, so your mental model carries over directly.
+
+### Avoid `map_elements()` (row-wise Python functions)
+
+It is the equivalent of `rowwise()` plus a slow R function: it drops you out
+of the Rust engine and loses parallelism. There is almost always a native
+expression that does the same job.
+
+## Suggested Learning Path
+
+```text
+Week 1: select / filter / with_columns / sort / group_by().agg   (eager)
+Week 2: expressions deep dive: when/then, .over(), .str, .dt, selectors
+Week 3: joins, pivot/unpivot, nulls, dtypes & casting
+Week 4: lazy API: scan_*(), explain(), collect(), streaming large files
+```
+
+## Resources
+
+- Polars user guide: <https://docs.pola.rs>
+- Polars 2.0 upgrade guide: <https://docs.pola.rs/releases/upgrade/2/>
+- API reference (Python): <https://docs.pola.rs/api/python/stable/reference/>
+- Source code: <https://github.com/pola-rs/polars>
