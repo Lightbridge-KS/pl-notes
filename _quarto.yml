@@ -9,6 +9,31 @@ book:
   site-url: https://pl-notes-lightbridge.netlify.app
   chapters:
     - index.qmd
+    - part: "Orientation"
+      chapters:
+        - text: Overview
+          href: contents/overview/polars-overview.qmd
+        - text: CheatSheet
+          href: contents/overview/polars-cheatsheet.qmd
+    - part: "Core Model"
+      chapters:
+        - contents/core/data-model.qmd
+        - contents/core/expressions.qmd
+        - contents/core/selectors.qmd
+    - part: "Transform"
+      chapters:
+        - contents/transform/verbs.qmd
+        - contents/transform/group-agg.qmd
+        - contents/transform/window.qmd
+        - contents/transform/joins.qmd
+        - contents/transform/reshape.qmd
+    - part: "Column Types"
+      chapters:
+        - contents/types/missing.qmd
+        - contents/types/datetime.qmd
+    - part: "Import & Scale"
+      chapters:
+        - contents/scale/lazy.qmd
 
 format:
   html:

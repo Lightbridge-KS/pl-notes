@@ -1,0 +1,641 @@
+---
+title: "Reshaping"
+subtitle: "≈ `pivot_longer()` · `pivot_wider()` · `separate_*()` · `unite()` · `complete()`"
+jupyter: python3
+---
+
+Reshaping moves values between positions (column name, row, cell) without
+changing them. tidyr and Polars have the same operations under different
+names. They differ in what happens when the data doesn't fit: mixed dtypes,
+duplicate cells, a wrong number of pieces, and row order. This chapter covers
+the verbs, then those cases.
+
+## In tidyverse {#sec-rs-tidyverse}
+
+R4DS's three rules of tidy data: each variable is a column, each observation
+is a row, each value is a cell. The tidyr verbs move data into those
+positions:
+
+```r
+library(tidyr)
+
+who2 |>                                    # lengthen; names hold three variables
+  pivot_longer(!(country:year), names_to = c("diagnosis", "gender", "age"),
+               names_sep = "_", values_to = "count", values_drop_na = TRUE)
+
+household |>                               # two value columns per child: .value
+  pivot_longer(!family, names_to = c(".value", "child"), names_sep = "_",
+               values_drop_na = TRUE)
+
+weather |>                                 # widen: one column per origin
+  pivot_wider(id_cols = time_hour, names_from = origin, values_from = temp)
+
+penguins |>                                # make implicit missing rows explicit
+  count(species, island) |> complete(species, island, fill = list(n = 0))
+```
+
+Polars splits the same work across `unpivot()`, `pivot()`, string methods,
+`explode()` / `unnest()`, and joins.
+
+## Mental model {#sec-rs-model}
+
+```text
+            index         on                          index     variable   value
+         ┌─────┬────┐ ┌───────┬───────┐            ┌─────┬────┐ ┌───────┐ ┌───────┐
+  WIDE   │ EWR │  1 │ │ 39.02 │ 26.06 │  unpivot   │ EWR │  1 │ │ temp  │ │ 39.02 │   LONG
+         │ JFK │  1 │ │ 39.02 │ 26.06 │  ───────►  │ JFK │  1 │ │ temp  │ │ 39.02 │
+         └─────┴────┘ └───────┴───────┘            │ EWR │  1 │ │ dewp  │ │ 26.06 │
+          origin hour   temp    dewp               │ JFK │  1 │ │ dewp  │ │ 26.06 │
+                                                   └─────┴────┘ └───────┘ └───────┘
+                       ◄───────  pivot(on="variable", index=["origin", "hour"], values="value")
+
+  unpivot: all `on` columns feed ONE value column        → their dtypes must unify
+  pivot  = group_by(index, on).agg(f(values)), then each distinct `on` value
+           becomes a column                              → f must give one value per cell
+```
+
+Two consequences. `unpivot()` needs a common dtype for the columns it stacks
+(@sec-rs-supertype). `pivot()` is an aggregation, so duplicate `(index, on)`
+pairs need an aggregate function (@sec-rs-duplicates).
+
+| tidyr argument | Polars argument | Note |
+|---|---|---|
+| `pivot_longer(cols)` | `unpivot(on=)` | `on=None` = every column not in `index` |
+| (implicit: all other columns) | `unpivot(index=)` | **not** implicit: omit it and those columns are dropped |
+| `names_to` / `values_to` | `variable_name=` / `value_name=` | defaults `"variable"` / `"value"` |
+| `names_sep` / `names_pattern` | `.str.split_exact()` / `.str.extract_groups()` + `unnest()` | a separate step (@sec-rs-names) |
+| `values_drop_na = TRUE` | `.drop_nulls("value")` | |
+| `id_cols` / `names_from` / `values_from` | `index=` / `on=` / `values=` | |
+| `values_fn` | `aggregate_function=` | default: one value per cell, else error |
+| `values_fill` | `.fill_null()` afterwards | also fills nulls from the data (@sec-rs-empty-cells) |
+| `names_sort = TRUE` | `sort_columns=True` | |
+| `names_sep` (wider) | `separator=` | used only with several `values` |
+
+: Argument names {.striped}
+
+One-line translations are in the cheatsheet's
+[Reshape](../overview/polars-cheatsheet.qmd#sec-cs-reshape) section.
+
+## Mechanics {#sec-rs-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import datetime as dt
+
+import polars as pl
+import polars.selectors as cs
+from pl_notes import datasets
+
+penguins_df = datasets.penguins()
+weather_df = datasets.weather()
+
+weather_df_jan1 = weather_df.filter(
+    pl.col("month") == 1, pl.col("day") == 1, pl.col("hour").is_in([1, 2])
+).select("origin", "hour", "temp", "dewp", "humid")
+weather_df_jan1
+```
+
+### Lengthening: `unpivot()` {#sec-rs-unpivot}
+
+```{python}
+weather_df_jan1.unpivot(
+    ["temp", "dewp", "humid"], index=["origin", "hour"],
+    variable_name="measure", value_name="value",
+).sort("origin", "hour", "measure").head(4)
+```
+
+`on` takes names or a selector. Without `index`, every column not in `on` is
+**dropped**, where `pivot_longer()` would keep it as an identifier:
+
+```{python}
+{
+    "index given": weather_df_jan1.unpivot(cs.float(), index=["origin", "hour"]).columns,
+    "index omitted": weather_df_jan1.unpivot(cs.float()).columns,
+}
+```
+
+(`melt()`, the old name, no longer exists in 2.0.)
+
+**Row order is unspecified**: the docstring says so, and it changes with the
+engine. Eager `unpivot()` stacks column by column; the same query run lazily
+came out row by row here, which is `pivot_longer()`'s order:
+
+```{python}
+tiny_df = pl.DataFrame({"id": ["a", "b", "c"], "x1": [1, 2, 3], "x2": [4, 5, 6]})
+
+{
+    "eager": tiny_df.unpivot(index="id")["id"].to_list(),
+    "lazy": tiny_df.lazy().unpivot(index="id").collect()["id"].to_list(),
+}
+```
+
+On a large lazy frame the rows come in interleaved chunks. If order matters,
+`.sort()` by the index and variable columns.
+
+### Names that carry data {#sec-rs-names}
+
+`pivot_longer()` splits names during the pivot. `unpivot()` doesn't; split
+the `variable` column afterwards. A small `who2`-style frame:
+
+```{python}
+who_df = pl.DataFrame({
+    "country": ["Thailand", "Thailand", "Laos"],
+    "year": [2012, 2013, 2013],
+    "sp_m_014": [120, 98, 15],
+    "sp_f_1524": [310, 287, 40],
+    "rel_m_65": [None, 12, 3],
+})
+
+(
+    who_df.unpivot(index=["country", "year"], variable_name="key", value_name="count")
+    .with_columns(
+        pl.col("key").str.split_exact("_", 2)              # 2 splits → struct of 3 fields
+        .struct.rename_fields(["diagnosis", "gender", "age"])
+    )
+    .unnest("key")                                         # struct fields → columns
+    .drop_nulls("count")                                   # values_drop_na = TRUE
+    .sort("country", "year", "diagnosis", "gender")
+)
+```
+
+`split_exact(by, n)` counts **splits**, not pieces, and names the fields
+`field_0`, `field_1`, …, hence `rename_fields()`. For `names_pattern`, use
+`str.extract_groups()`: named capture groups such as `(?<gender>[mf])` become
+the field names, so no rename is needed (see the recipe in @sec-rs-recipes).
+
+```text
+ "sp_m_014" ──str.split("_")──────────► ["sp", "m", "014"]     List    any length  → explode()
+            ──str.split_exact("_", 2)─► {"sp", "m", "014"}     Struct  fixed fields → unnest()
+            ──str.extract_groups(re)──► {diagnosis: "sp", …}   Struct  named fields → unnest()
+```
+
+### Several value columns: `.value` {#sec-rs-value}
+
+`.value` in `names_to` means "this part of the name is a column name, not
+data". Polars has no sentinel. A `household`-style frame, two columns per
+child:
+
+```{python}
+household_df = pl.DataFrame({
+    "family": [1, 2, 3],
+    "dob_child1": [dt.date(1998, 11, 26), dt.date(1996, 6, 22), dt.date(2002, 7, 11)],
+    "dob_child2": [dt.date(2000, 1, 29), None, dt.date(2004, 4, 5)],
+    "name_child1": ["Malee", "Somchai", "Nok"],
+    "name_child2": ["Anan", None, "Ploy"],
+})
+```
+
+**Route 1: unpivot, split, pivot the `.value` part back out.**
+
+```{python}
+(
+    household_df.unpivot(index="family")
+    .with_columns(pl.col("variable").str.split_exact("_", 1).struct.rename_fields([".value", "child"]))
+    .unnest("variable")
+    .pivot(".value", index=["family", "child"], values="value")
+    .drop_nulls()
+    .sort("family", "child")
+)
+```
+
+It works, but `dob` comes back as `str`: Date and String had to share one
+value column on the way (@sec-rs-supertype).
+
+**Route 2: stack the column groups.** One `select()` per child, then
+`pl.concat()`. Every column keeps its dtype:
+
+```{python}
+pl.concat([
+    household_df.select("family", child=pl.lit(c), dob=f"dob_{c}", name=f"name_{c}")
+    for c in ["child1", "child2"]
+]).drop_nulls().sort("family", "child")
+```
+
+### Widening: `pivot()` {#sec-rs-pivot}
+
+```{python}
+weather_df_wide = weather_df.pivot("origin", index="time_hour", values="temp")
+weather_df_wide.head(3)
+```
+
+**Columns** follow the first appearance of each `on` value, like
+`pivot_wider()`; `sort_columns=True` sorts them and `on_columns=` picks and
+orders them. **Rows** follow the first appearance of each `index` value
+(eager `maintain_order=True`). That is not chronological here: `weather` is
+sorted by origin, so hours that EWR lacks first appear in the JFK and LGA
+blocks and land at the bottom:
+
+```{python}
+weather_df_wide["time_hour"].is_sorted(), weather_df_wide.tail(2)
+```
+
+With several `values`, names are `{value}{separator}{on}`, as in tidyr:
+
+```{python}
+weather_df.pivot("origin", index="time_hour", values=["temp", "dewp"]).columns
+```
+
+Non-string `on` values are converted to names (`2007` → `"2007"`, null →
+`"null"`). Several `on` columns, e.g. `on=["sex", "year"]`, give
+struct-literal names such as `{"male",2007}` instead of tidyr's `male_2007`.
+Build one key with `pl.concat_str("sex", "year", separator="_")` and pivot on
+that.
+
+### Aggregating cells {#sec-rs-agg}
+
+The mental model said `pivot()` is `group_by().agg()` plus a spread. Proof:
+
+```{python}
+pivot_direct = penguins_df.pivot(
+    "island", index="species", values="body_mass_g", aggregate_function="mean", sort_columns=True
+).sort("species")
+
+pivot_two_step = (
+    penguins_df.group_by("species", "island").agg(pl.col("body_mass_g").mean())
+    .pivot("island", index="species", values="body_mass_g", sort_columns=True)
+    .sort("species")
+)
+pivot_two_step.equals(pivot_direct)
+```
+
+`aggregate_function` takes `"min"`, `"max"`, `"first"`, `"last"`, `"sum"`,
+`"mean"`, `"median"`, `"len"`, or an expression on `pl.element()` (the values
+in one cell). The default, `None`, means `"item"`: exactly one value per cell,
+or a `ComputeError` (@sec-rs-duplicates). tidyr's list-column output is
+`implode()`:
+
+```{python}
+penguins_df.pivot(
+    "island", index="species", values="year",
+    aggregate_function=pl.element().unique().sort().implode(), sort_columns=True,
+).sort("species")
+```
+
+Cells with no rows hold `[]`, the aggregate of nothing (@sec-rs-empty-cells).
+
+### Lazy `pivot()` needs `on_columns=` {#sec-rs-lazy-pivot}
+
+A `LazyFrame` knows its output schema before it reads data
+([Data Model](../core/data-model.qmd#sec-dm-containers)). A pivot's schema
+depends on the distinct `on` values, so lazy `pivot()` makes you list them:
+
+```{python}
+#| error: true
+weather_df.lazy().pivot("origin", index="time_hour", values="temp")
+```
+
+```{python}
+origins = weather_df["origin"].unique().sort()   # the data pass, done eagerly
+
+weather_df.lazy().pivot(
+    "origin", on_columns=origins, index="time_hour", values="temp"
+).collect_schema()
+```
+
+`on_columns` filters as well as lists: an unlisted value is dropped silently,
+and a listed value with no data becomes an all-null column.
+
+```{python}
+weather_df.lazy().pivot(
+    "origin", on_columns=["EWR", "JFK", "BOS"], index="time_hour", values="temp"
+).sort("time_hour").collect().head(2)
+```
+
+LGA is gone, BOS is empty, nothing warned. Lazy `pivot()` also defaults to
+`maintain_order=False`, so its row order changes between runs; sort it.
+dbplyr's `pivot_wider()` faces the same problem and runs an extra query to
+find the names; Polars makes that step yours.
+
+### Lists and structs: `explode()` and `unnest()` {#sec-rs-nested}
+
+`explode()` ≈ `unnest_longer()`: one row per list element. Null and empty
+lists are treated differently:
+
+```{python}
+orders_df = pl.DataFrame({"order": [1, 2, 3, 4], "items": [["tea", "milk"], [], None, ["rice"]]})
+
+{
+    "default": orders_df.explode("items")["order"].to_list(),
+    "keep_nulls=False": orders_df.explode("items", keep_nulls=False)["order"].to_list(),
+    "empty_as_null=True": orders_df.explode("items", empty_as_null=True)["order"].to_list(),
+}
+```
+
+By default the empty order 2 disappears and the null order 3 stays as a null
+row. `unnest_longer()`'s default (`keep_empty = FALSE`) drops both, which is
+`keep_nulls=False`; `keep_empty = TRUE` keeps both, which is
+`empty_as_null=True`. Exploding several columns at once requires equal list
+lengths in every row, otherwise `ShapeError`.
+
+`unnest()` ≈ `unnest_wider()`, for **struct** columns. `separator=` prefixes
+the field names, like `names_sep`:
+
+```{python}
+penguins_df.head(2).select(
+    "species", bill=pl.struct(length="bill_length_mm", depth="bill_depth_mm")
+).unnest("bill", separator="_")
+```
+
+A list column must become a struct first: `.list.to_struct(fields=[...])`
+(short lists pad with null), or take elements with
+`.list.get(i, null_on_oob=True)`.
+
+### Splitting and uniting strings {#sec-rs-strings}
+
+The three splitters differ in what they return and in how they treat a wrong
+number of pieces:
+
+```{python}
+codes_df = pl.DataFrame({"key": ["sp_m_014", "ep_m", "sp_f_25_34"]})
+
+codes_df.with_columns(
+    split=pl.col("key").str.split("_"),                 # List: all pieces
+    split_exact=pl.col("key").str.split_exact("_", 2),  # Struct: exactly 3 fields
+    splitn=pl.col("key").str.splitn("_", 3),            # Struct: at most 3, rest in the last
+)
+```
+
+| tidyr | Polars | Too few pieces | Too many pieces |
+|---|---|---|---|
+| `separate_longer_delim()` | `str.split()` + `explode()` | n/a | n/a |
+| `separate_wider_delim()` | `str.split_exact()` + `unnest()` | null-padded | **dropped** |
+| `separate_wider_delim(too_many = "merge")` | `str.splitn()` + `unnest()` | null-padded | kept in the last field |
+| `separate_wider_regex()` | `str.extract_groups()` + `unnest()` | no match → all null | no match → all null |
+
+: tidyr errors on a wrong piece count by default; Polars never does {.striped}
+
+`str.split(by, literal=False)` splits on a regex.
+
+`unite()` ≈ `pl.concat_str()`. Non-string columns are cast for you; nulls are
+not. `unite()` writes the text `"NA"`; `concat_str()` makes the whole result
+null unless `ignore_nulls=True` (≈ `na.rm = TRUE`):
+
+```{python}
+parts_df = pl.DataFrame({"diagnosis": ["sp", "rel", None], "gender": ["m", None, "f"], "age": [14, 65, 25]})
+
+parts_df.with_columns(
+    key=pl.concat_str("diagnosis", "gender", "age", separator="_"),
+    key_skip=pl.concat_str("diagnosis", "gender", "age", separator="_", ignore_nulls=True),
+)
+```
+
+`unite()` also drops its inputs (`remove = TRUE`); in Polars, `.drop()` them.
+
+### `transpose()` {#sec-rs-transpose}
+
+`t()` for frames. Pass `include_header=True` to keep the old column names, and
+`column_names=` to take the new ones from a column. Each new column needs one
+dtype, so mixed-type rows come out as `str`; for anything but display,
+unpivot + pivot keeps dtypes under control.
+
+```{python}
+penguins_df.group_by("species").agg(cs.ends_with("_mm").mean().round(1)).sort("species").transpose(
+    include_header=True, header_name="measure", column_names="species"
+)
+```
+
+### Making implicit missing rows explicit: `complete()` {#sec-rs-complete}
+
+A row that doesn't exist is an *implicit* missing value
+([Missing Values](../types/missing.qmd)). `complete()` is a cross join of the
+unique values, then a left join of the data onto that grid:
+
+```{python}
+penguin_counts_df = penguins_df.group_by("species", "island").agg(n=pl.len())
+
+species_islands_df = penguins_df.select("species").unique().join(
+    penguins_df.select("island").unique(), how="cross"              # expand(species, island)
+)
+(
+    species_islands_df
+    .join(penguin_counts_df, on=["species", "island"], how="left")  # complete(species, island)
+    .with_columns(pl.col("n").fill_null(0))                          # fill = list(n = 0)
+    .sort("species", "island")
+)
+```
+
+| tidyr | Polars |
+|---|---|
+| `expand(df, a, b)` | `df.select("a").unique().join(df.select("b").unique(), how="cross")` |
+| `expand(df, nesting(a, b))` | `df.select("a", "b").unique()` |
+| `crossing(a = x, b = y)` | `pl.DataFrame({"a": x}).join(pl.DataFrame({"b": y}), how="cross")` |
+| `complete(df, a, b)` | `grid.join(df, on=["a", "b"], how="left")` |
+| the missing combinations only | `grid.join(df, on=["a", "b"], how="anti")` |
+| `full_seq(x, 1)` in `complete()` | build the grid from `pl.int_range()` / `pl.datetime_range()` |
+
+: `complete()` and friends {.striped}
+
+Join row order is not guaranteed without `maintain_order=`; see
+[Joins](joins.qmd).
+
+## Where it bites {#sec-rs-gotchas}
+
+| tidyr behaviour | Polars behaviour |
+|---|---|
+| `pivot_longer()` keeps non-`cols` columns as ids | `unpivot()` without `index` drops them |
+| `pivot_longer()` errors on incompatible types | `unpivot()` casts to a supertype, silently |
+| `pivot_longer()` output goes row by row | `unpivot()` row order is unspecified |
+| duplicate cells: a warning and list-columns | duplicate cells: `ComputeError` |
+| missing combinations are `NA`, whatever `values_fn` is | `"sum"` and `"len"` give 0, the others null |
+| `values_fill` fills only missing combinations | `fill_null()` also fills nulls from the data |
+| `names_from = c(a, b)` → `a_b` | `on=["a", "b"]` → `{"a","b"}` |
+| `separate_wider_*()` errors on a wrong piece count | `split_exact()` pads with null or drops pieces |
+| `unite()` writes `"NA"` | `concat_str()` returns null |
+| `unnest_longer()` drops `NULL` and empty elements | `explode()` keeps nulls, drops empty lists |
+
+: The differences at a glance {.striped}
+
+### `unpivot()` casts to a supertype {#sec-rs-supertype}
+
+The `value` column has one dtype, so Polars casts every `on` column to their
+supertype, without a warning, including casts that destroy meaning:
+
+```{python}
+mixed_df = pl.DataFrame({"id": [1], "n": [1], "x": [1.5], "s": ["a"], "d": [dt.date(2013, 1, 1)]})
+
+{
+    pair: str(mixed_df.unpivot(list(pair), index="id")["value"].to_list())
+    for pair in [("n", "x"), ("n", "s"), ("d", "s"), ("d", "n")]
+}
+```
+
+Integer + float → float is what R does too. The other three are errors in
+`pivot_longer()`, because vctrs won't combine character with double, or Date
+with integer. Polars turns the date into `"2013-01-01"` next to a string, and
+into `15706` (days since 1970) next to an integer. Only types with no
+supertype at all, such as a list and an integer, raise a `SchemaError`.
+
+**Rule:** check the `value` dtype after `unpivot()`. Unpivot same-typed
+columns (`on=cs.numeric()`), or use route 2 of @sec-rs-value.
+
+### One cell, two values {#sec-rs-duplicates}
+
+Widen `weather` by origin, keyed by date and hour:
+
+```{python}
+#| error: true
+weather_df.pivot("origin", index=["month", "day", "hour"], values="temp")
+```
+
+`hour` is local clock time. On 3 November 2013 the clocks went back, so 01:00
+happened twice. `time_hour` is an instant, so it is unique, and the earlier
+pivot worked:
+
+```{python}
+weather_df.filter(pl.col("month") == 11, pl.col("day") == 3, pl.col("hour") == 1).select(
+    "origin", "hour", "temp", "time_hour"
+).sort("origin", "time_hour").head(2)
+```
+
+`pivot_wider()` would warn and return list-columns; Polars raises. Find the
+duplicates with a grouped count, as R4DS does:
+
+```{python}
+weather_df.group_by("origin", "month", "day", "hour").len().filter(pl.col("len") > 1).sort("origin")
+```
+
+Then fix the key (`index="time_hour"`) or choose an `aggregate_function`.
+
+### Empty cells are not always null {#sec-rs-empty-cells}
+
+A cell with no rows gets the aggregate of nothing. For `"sum"` and `"len"`
+that is 0:
+
+```{python}
+{
+    agg: penguins_df.pivot("island", index="species", values="year", aggregate_function=agg)
+    .filter(pl.col("species") == "Gentoo").select("Dream").item()
+    for agg in ["len", "sum", "mean", "first"]
+}
+```
+
+No Gentoo lives on Dream. A count of 0 is right; a sum of 0 hides the
+difference between "measured zero" and "never measured".
+
+The reverse problem: `.fill_null(0)` after a pivot fills missing combinations
+*and* nulls that were in the data, because both are null by then.
+`values_fill` fills only the former. If the difference matters, pivot a
+`"len"` table too and use it to find the real gaps.
+
+### `split_exact()` never complains {#sec-rs-split-silent}
+
+In @sec-rs-strings, `"ep_m"` was padded with null and `"sp_f_25_34"` lost
+`"34"`. `separate_wider_delim()` would have stopped. Check the piece count
+yourself:
+
+```{python}
+codes_df.filter(pl.col("key").str.split("_").list.len() != 3)
+```
+
+`extract_groups()` is the same: a non-matching string becomes all nulls.
+Anchor the pattern (`^…$`) and filter for the nulls.
+
+### Lists vs structs {#sec-rs-list-struct}
+
+`str.split()` returns a List; `split_exact()`, `splitn()` and
+`extract_groups()` return a Struct. `explode()` takes lists and `unnest()`
+takes structs, so `str.split()` followed by `unnest()` fails:
+
+```{python}
+#| error: true
+codes_df.with_columns(pl.col("key").str.split("_")).unnest("key")
+```
+
+`explode()` on a plain String column fails the same way: a string is not a
+list of characters.
+
+## Recipes {#sec-rs-recipes}
+
+**A summary table, wide by species, for display.** Unpivot, aggregate inside
+`pivot()`, and fix the row order with an `Enum` (≈ `fct_inorder()`):
+
+```{python}
+measure_cols = ["bill_length_mm", "bill_depth_mm", "flipper_length_mm", "body_mass_g"]
+
+(
+    penguins_df.unpivot(measure_cols, index="species", variable_name="measure")
+    .with_columns(pl.col("measure").cast(pl.Enum(measure_cols)))
+    .pivot("species", index="measure", values="value",
+           aggregate_function=pl.element().mean().round(1), sort_columns=True)
+    .sort("measure")
+)
+```
+
+The integer `body_mass_g` was cast to `Float64` to share the `value` column,
+which is harmless here.
+
+**Long → wide → long round trip.** Pivoting back recovers the original, once
+both sides are sorted:
+
+```{python}
+weather_df_measures = weather_df.select("origin", "time_hour", "temp", "dewp", "humid")
+
+weather_df_long = weather_df_measures.unpivot(
+    ["temp", "dewp", "humid"], index=["origin", "time_hour"], variable_name="measure"
+)
+weather_df_back = weather_df_long.pivot("measure", index=["origin", "time_hour"], values="value")
+
+weather_df_back.sort("origin", "time_hour").equals(weather_df_measures.sort("origin", "time_hour"))
+```
+
+**Split a sex-and-age code with no separator** (`who`'s `m014`, `f1524`,
+`f65`). Optional groups handle the open-ended `65` band:
+
+```{python}
+age_codes_df = pl.DataFrame({"code": ["m014", "f1524", "m2534", "f65", "x99"]})
+
+age_codes_df.with_columns(
+    pl.col("code").str.extract_groups(r"^(?<sex>[mf])(?<age_lo>0|\d{2})(?<age_hi>\d{2})?$")
+).unnest("code").with_columns(cs.starts_with("age").cast(pl.Int8))
+```
+
+`x99` doesn't match, so its row is all null.
+
+**Complete an hourly weather grid** (≈ `complete(origin, time_hour =
+seq(min, max, by = "hour"))`). Build every hour with `pl.datetime_range()`,
+cross it with the origins, and left-join the data. A `True` flag added before
+the join marks the rows that existed:
+
+```{python}
+hours_df = weather_df.select(
+    time_hour=pl.datetime_range(pl.col("time_hour").min(), pl.col("time_hour").max(), "1h")
+)
+weather_grid_df = weather_df.select(pl.col("origin").unique()).join(hours_df, how="cross")
+
+weather_df_complete = weather_grid_df.join(
+    weather_df.with_columns(observed=pl.lit(True)), on=["origin", "time_hour"], how="left"
+)
+weather_df_complete.group_by("origin").agg(
+    added_rows=pl.col("observed").is_null().sum(),
+    null_temp=pl.col("temp").is_null().sum(),
+).sort("origin")
+```
+
+EWR gained 27 rows (implicit missing) and has 28 null temperatures: those 27
+plus one null already in the data (explicit missing). The range is
+time-zone aware, so 3 November has both 01:00 EDT and 01:00 EST. For a
+single time column, `weather_df.sort("origin", "time_hour").upsample(
+"time_hour", every="1h", group_by="origin")` builds the same grid in one call
+(it needs sorted input).
+
+## See also {#sec-rs-see-also}
+
+- Cheatsheet:
+  [Reshape](../overview/polars-cheatsheet.qmd#sec-cs-reshape) ·
+  [List Columns & Structs](../overview/polars-cheatsheet.qmd#sec-cs-nested) ·
+  [Strings](../overview/polars-cheatsheet.qmd#sec-cs-strings)
+- Related: [Missing Values](../types/missing.qmd) (implicit vs explicit) ·
+  [Joins & Concatenation](joins.qmd) (cross, anti, `maintain_order=`) ·
+  [Grouping & Aggregation](group-agg.qmd) (`pivot()` is a `group_by()`) ·
+  [Data Model & Dtypes](../core/data-model.qmd) (supertypes)
+- Polars user guide: [Pivots](https://docs.pola.rs/user-guide/transformations/pivot/) ·
+  [Unpivots](https://docs.pola.rs/user-guide/transformations/unpivot/)
+- Python API: [`DataFrame.pivot`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.pivot.html) ·
+  [`DataFrame.unpivot`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.unpivot.html) ·
+  [`DataFrame.explode`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.explode.html)
+- R4DS 2e: [Data tidying](https://r4ds.hadley.nz/data-tidy.html) ·
+  `vignette("pivot", package = "tidyr")`

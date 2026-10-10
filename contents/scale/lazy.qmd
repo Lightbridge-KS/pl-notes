@@ -1,0 +1,739 @@
+---
+title: "Lazy API & Query Optimization"
+subtitle: "≈ dbplyr · `arrow::open_dataset()` · duckplyr"
+jupyter: python3
+---
+
+A `LazyFrame` is a query that has not run yet. Polars rewrites it before it
+runs, so a lazy pipeline can skip files, columns and rows that an eager one
+must read first and throw away later. This chapter covers how to read the
+plan, each rewrite the optimizer makes (shown in a plan), what the default
+streaming engine changes, a timed eager-vs-lazy comparison, and the traps.
+The basics (`scan_*`, `collect()`, `explain()`) are in the
+[Overview](../overview/polars-overview.qmd#sec-ov-lazy) and the
+[cheatsheet](../overview/polars-cheatsheet.qmd#sec-cs-lazy).
+
+## In tidyverse {#sec-lazy-tidyverse}
+
+```r
+library(dplyr)
+
+# dbplyr: verbs build SQL; the database plans and runs it
+jfk_late <- tbl(con, "flights") |>
+  filter(origin == "JFK", dep_delay > 60) |>
+  group_by(carrier) |>
+  summarise(n = n(), avg_delay = mean(dep_delay, na.rm = TRUE))
+show_query(jfk_late)   # the SQL
+explain(jfk_late)      # the SQL plus the database's query plan
+collect(jfk_late)      # run it, return a tibble
+
+# arrow: verbs build an Acero plan over a directory of Parquet files
+arrow::open_dataset("flights/") |>        # discovers files and schema, reads no rows
+  filter(origin == "JFK") |>
+  select(carrier, dep_delay) |>
+  collect()
+
+# duckplyr: the same verbs, planned and run by DuckDB
+duckplyr::read_parquet_duckdb("flights.parquet") |> filter(origin == "JFK") |> explain()
+```
+
+All three split *describe* from *run*: verbs grow a query object, a backend
+plans it, and `collect()` executes it. Polars is all three roles in one
+library: the `LazyFrame` is the query object, and Polars' own optimizer and
+engines plan and run it. There is no translation to SQL, so every expression
+that works eagerly also works lazily.
+
+|  | dbplyr | arrow `open_dataset()` | duckplyr | Polars |
+|---|---|---|---|---|
+| The plan is written in | SQL | an Acero exec plan | a DuckDB relational plan | a Polars logical plan |
+| Show the plan | `show_query()`, `explain()` | `show_exec_plan()` | `explain()` | `lf.explain()` |
+| Run, return a data frame | `collect()` | `collect()` | `collect()` | `lf.collect()` |
+| Run, keep the result out of R | `compute()` (a database table) | `write_dataset()` | `compute_parquet()` | `lf.sink_parquet()` |
+
+: One pattern, four backends {.striped}
+
+## Mental model {#sec-lazy-model}
+
+```text
+ BUILD (plain Python, no data)     OPTIMIZE (at explain / collect)          EXECUTE (collect / sink)
+ ─────────────────────────────     ──────────────────────────────────       ─────────────────────────────────
+ pl.scan_parquet(path)             naive plan ──► optimized plan            streaming engine (default):
+   .filter(...)            ─────►   • filters move into the scan   ─────►    batches flow through all
+   .group_by(...)                   • the scan reads only used columns        operators at once
+   .agg(...)                        • head()/slice move into the scan       in-memory engine:
+                                    • duplicate expressions/subplans          each node finishes its whole
+ a LazyFrame = a tree of plan         run once                                result before the next starts
+ nodes; print(lf) shows the         • sorts nobody observes are dropped     ──► DataFrame (collect)
+ naive plan                        lf.explain() prints this                 ──► files     (sink_*)
+```
+
+Two consequences drive everything below:
+
+- **The optimizer sees the whole query.** An eager `read_parquet()` can't
+  know that you will keep 3 of 19 columns and a few percent of the rows. A
+  scan that is still in the plan can.
+- **Nothing is checked or computed until something asks.** `collect()`,
+  `collect_schema()` and `explain()` ask; building the plan does not.
+
+## Mechanics {#sec-lazy-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+Every file in this chapter goes into a temporary directory that is deleted at
+the end. `show_plan()` prints `lf.explain()` with that directory shortened
+to `<tmp>` and random cache ids masked, so the plans read the same on every
+render.
+
+```{python}
+import re
+import tempfile
+import time
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+from polars.testing import assert_frame_equal
+from pl_notes import datasets
+
+tmp = tempfile.TemporaryDirectory()
+data_dir = Path(tmp.name)
+
+flights_df = datasets.flights()
+airlines_df = datasets.airlines()
+flights_df.write_parquet(data_dir / "flights.parquet")
+airlines_df.write_parquet(data_dir / "airlines.parquet")
+
+
+def show_plan(plan: pl.LazyFrame | str, **kwargs) -> None:
+    """print(plan.explain(**kwargs)), with the temp path and random ids masked."""
+    text = plan if isinstance(plan, str) else plan.explain(**kwargs)
+    text = text.replace(str(data_dir), "<tmp>")
+    print(re.sub(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", "<id>", text))
+```
+
+### Sources: scan, don't read {#sec-lazy-sources}
+
+```{python}
+flights_lf = pl.scan_parquet(data_dir / "flights.parquet")
+airlines_lf = pl.scan_parquet(data_dir / "airlines.parquet")
+
+show_plan(flights_lf)
+```
+
+A one-node plan: a scan that would read all 19 columns. Displaying
+`flights_lf` in a notebook shows the same naive plan, never rows.
+
+| Source | Function | What the reader can skip |
+|---|---|---|
+| Parquet file, directory, or glob | `pl.scan_parquet()` | columns, rows (filters, row-group statistics, hive partitions), slices |
+| CSV | `pl.scan_csv()` | columns, rows (filters applied while parsing), slices |
+| NDJSON | `pl.scan_ndjson()` | columns, rows |
+| Arrow IPC / Feather | `pl.scan_ipc()` | columns, rows |
+| an in-memory `DataFrame` | `df.lazy()` | columns only: the data is already in memory |
+
+: Lazy sources {.striped}
+
+### Reading a plan {#sec-lazy-explain}
+
+```{python}
+jfk_late_lf = (
+    flights_lf
+    .filter(pl.col("origin") == "JFK", pl.col("dep_delay") > 60)
+    .group_by("carrier")
+    .agg(n=pl.len(), avg_delay=pl.col("dep_delay").mean())
+    .sort("n", descending=True)
+)
+show_plan(jfk_late_lf, optimized=False)
+```
+
+That is the plan as written. `explain()` prints the tree root first, so
+**read it bottom-up**: data enters at the scan (19 columns), passes the two
+filters, is aggregated, then sorted. Each `FROM` points at the child node.
+Now the plan that will actually run:
+
+```{python}
+show_plan(jfk_late_lf)
+```
+
+Two rewrites happened. **Predicate pushdown**: both filters disappeared into
+the scan as one `SELECTION`, so the reader drops rows as it reads them.
+**Projection pushdown**: the scan reads 3 of 19 columns, `origin` only so it
+can filter, and just `carrier` and `dep_delay` go on to the aggregation
+(`simple π`; π is relational-algebra notation for projection). Parquet
+stores each column separately, so the other 16 are never touched on disk.
+
+| Node | Meaning | dplyr / SQL analogue |
+|---|---|---|
+| `Parquet SCAN`, `Csv SCAN`, `DF [...]` | a source; `DF` is an in-memory frame | `FROM` |
+| `PROJECT k/n COLUMNS` (in a scan) | columns the reader reads | `SELECT a, b` pushed into the reader |
+| `SELECTION:` (in a scan) | a filter applied by the reader | `WHERE` pushed into the reader |
+| `SLICE:` (in a scan) | rows the reader stops after | `LIMIT` |
+| `ESTIMATED ROWS:` | size estimate used for join planning | |
+| `FILTER … FROM` | a filter that stays where it was written | `filter()` |
+| `simple π k/n [...]` | picks columns, computes nothing | `select(a, b)` |
+| `SELECT [...]`, `WITH_COLUMNS:` | evaluates expressions | `transmute()`, `mutate()` |
+| `AGGREGATE … BY … FROM` | group-by aggregation | `summarise(.by = )` |
+| `SORT BY` (`[slice: …]` = top-k) | sort | `arrange()`, `slice_max()` |
+| `… JOIN: LEFT PLAN … RIGHT PLAN` | a join, both inputs indented | `inner_join()` |
+| `CACHE[id: …]` | a subplan computed once and read again | `compute()` |
+| `OPAQUE_PYTHON` | a Python function the optimizer can't see into | |
+
+: Plan nodes you will meet {.striped}
+
+`explain(format="tree")` draws the same plan as a box diagram, and
+`lf.show_graph()` renders it with Graphviz.
+
+### The optimizations, one plan each {#sec-lazy-optimizations}
+
+Each optimization rewrites the tree, and each has a flag in
+`pl.QueryOptFlags` that turns it off. Turning one off is the easiest way to
+see what it did.
+
+#### Predicate pushdown {#sec-lazy-predicate}
+
+A filter written *after* a join:
+
+```{python}
+show_plan(
+    flights_lf.join(airlines_lf, on="carrier")
+    .filter(pl.col("origin") == "JFK", pl.col("carrier") == "AA")
+    .select("name", "dep_delay")
+)
+```
+
+Each condition moved to the earliest point that has its columns:
+`origin == "JFK"` into the flights scan, and `carrier == "AA"` into **both**
+scans, because `carrier` is the join key. Projection pushdown needs no
+separate demo: every optimized plan here shows it as `PROJECT k/n COLUMNS`.
+
+#### Slice pushdown {#sec-lazy-slice}
+
+```{python}
+show_plan(flights_lf.head(5))
+print("---")
+show_plan(flights_lf.sort("dep_delay", descending=True).head(3))
+```
+
+`head(5)` became a `SLICE` inside the reader: preview a huge file and only
+the first rows are read. `sort().head(3)` became a top-k sort
+(`SORT BY [slice: (0, 3, …)]`), and the scan received a *dynamic predicate*:
+a filter whose threshold the top-k node raises as it finds larger values, so
+rows that can no longer make the top 3 are dropped as they are read. This is
+dplyr's `slice_max(dep_delay, n = 3)`, derived automatically from
+`sort` + `head`.
+
+#### Expression simplification {#sec-lazy-simplify}
+
+```{python}
+not_late_lf = flights_lf.filter(~(pl.col("dep_delay") > 10)).select("dep_delay")
+show_plan(not_late_lf)
+print("---")
+show_plan(not_late_lf, optimizations=pl.QueryOptFlags(simplify_expression=False))
+```
+
+`~(dep_delay > 10)` became `dep_delay <= 10`: one comparison instead of a
+comparison plus a negation.
+
+#### Common subexpressions and subplans {#sec-lazy-cse}
+
+[Expressions & Contexts](../core/expressions.qmd#sec-expr-parallel) shows
+an expression reused through a Python variable being computed once
+(`__POLARS_CSER_…`). With that rewrite off, it is computed twice:
+
+```{python}
+delay_hr = pl.col("dep_delay") / 60
+show_plan(
+    flights_lf.select(delay_hr=delay_hr, delay_hr_sq=delay_hr**2),
+    optimizations=pl.QueryOptFlags(comm_subexpr_elim=False),
+)
+```
+
+The same idea at the level of whole plans: a lazy frame used twice, here as
+both sides of a join.
+
+```{python}
+jfk_flights_lf = flights_lf.filter(pl.col("origin") == "JFK")
+
+carrier_stats_lf = jfk_flights_lf.group_by("carrier").agg(n=pl.len()).join(
+    jfk_flights_lf.group_by("carrier").agg(avg_delay=pl.col("dep_delay").mean()),
+    on="carrier",
+)
+show_plan(carrier_stats_lf)
+```
+
+The right side reads `CACHE[id: <id>]` with nothing under it: it reuses the
+left side's scan instead of reading the file again. In dbplyr you would get
+this only by calling `compute()` yourself.
+
+#### Sorts nobody observes {#sec-lazy-sorts}
+
+```{python}
+show_plan(flights_lf.sort("dep_delay").group_by("carrier").agg(pl.len()))
+print("---")
+show_plan(
+    flights_lf.sort("dep_delay")
+    .sort("arr_delay", maintain_order=True)
+    .select("dep_delay", "arr_delay")
+)
+```
+
+In the first plan the sort is gone: an unordered `group_by` can't observe
+it. In the second, two sorts became one sort with two keys. R's sorting is
+stable, so `arrange(dep_delay) |> arrange(arr_delay)` breaks ties in
+`arr_delay` by `dep_delay`. Polars' `sort()` is not stable unless you pass
+`maintain_order=True`; without it, the first sort is dropped entirely.
+
+#### All the flags
+
+| `pl.QueryOptFlags(...)` | What it does | Shown in |
+|---|---|---|
+| `predicate_pushdown` | moves filters toward (and into) the scan | @sec-lazy-predicate |
+| `projection_pushdown` | reads only columns used later | every plan |
+| `slice_pushdown` | moves `head`/`slice` toward the scan | @sec-lazy-slice |
+| `simplify_expression` | rewrites expressions into simpler equivalents | @sec-lazy-simplify |
+| `comm_subexpr_elim` | computes duplicate expressions once | @sec-lazy-cse |
+| `comm_subplan_elim` | computes duplicate subplans once (`CACHE`) | @sec-lazy-cse |
+| `check_order_observe` | drops ordering work whose order is never observed | @sec-lazy-sorts |
+| `sort_collapse` | merges consecutive sorts into one | @sec-lazy-sorts |
+| `cluster_with_columns` | merges sequential independent `with_columns` | |
+| `fast_projection` | runs column-only projections without the expression engine (`simple π`) | |
+| `join_order` | reorders chains of inner equi-joins by estimated size | |
+| `row_estimate` | uses row estimates to pick join build sides | |
+| `pre_partition_hive` | pre-partitions hive-partitioned joins on the partition key | |
+
+: All default to `True`; `pl.QueryOptFlags.none()` starts with all off {.striped}
+
+`collect()`, `sink_*()` and `pl.collect_all()` take the same
+`optimizations=` argument. The API is marked **unstable**. In Polars 1.x the
+flags were keyword arguments of `collect()`; 2.0 removed them (@sec-lazy-gotchas).
+The naive plan in @sec-lazy-explain is what `pl.QueryOptFlags.none()` gives.
+
+### Execution: the streaming engine {#sec-lazy-execution}
+
+| `collect(engine=…)` | What runs |
+|---|---|
+| `"auto"` (default) | the engine set by `pl.Config.set_engine_affinity()` or `POLARS_ENGINE_AFFINITY`; if neither is set, **streaming** |
+| `"streaming"` | the source emits batches; every operator works on batches in parallel |
+| `"in-memory"` | each node computes its whole result before the next node starts |
+| `"gpu"` | NVIDIA GPUs via `cudf-polars` |
+
+: Engines in Polars 2.0 {.striped}
+
+If the chosen engine can't run part of a query, Polars falls back to the
+in-memory engine for it. `explain()` prints the logical plan, which is the
+same for every engine. To see the streaming engine's physical plan, use
+`lf.show_graph(plan_stage="physical", raw_output=True)`: it returns Graphviz
+DOT text whose legend marks in-memory fallback nodes.
+
+Streaming means a filter or `with_columns` never holds more than a few
+batches at a time. Only operators that must see everything keep state:
+`group_by` keeps one accumulator per group, a join keeps a hash table of one
+side, a sort keeps all rows. Memory then scales with that state, not with
+the input, which is how a query can run on files larger than RAM. You can
+watch the batches directly:
+
+```{python}
+batches = flights_lf.select("carrier", "dep_delay").collect_batches(chunk_size=100_000)
+[batch.height for batch in batches]
+```
+
+#### Row order is not guaranteed {#sec-lazy-order}
+
+The price of parallel batches: operators that combine rows emit them in
+whatever order the threads finish. The same left join, run four ways:
+
+```{python}
+keys_df = flights_df.select("carrier", "flight")
+named_lf = keys_df.lazy().join(airlines_df.lazy(), on="carrier", how="left")
+named_ordered_lf = keys_df.lazy().join(
+    airlines_df.lazy(), on="carrier", how="left", maintain_order="left"
+)
+{   # does the result keep flights' row order?
+    "eager DataFrame.join()": keys_df.join(airlines_df, on="carrier", how="left")
+    .select(keys_df.columns).equals(keys_df),
+    "collect(engine='in-memory')": named_lf.collect(engine="in-memory")
+    .select(keys_df.columns).equals(keys_df),
+    "collect()  (streaming)": named_lf.collect().select(keys_df.columns).equals(keys_df),
+    "maintain_order='left'": named_ordered_lf.collect().select(keys_df.columns).equals(keys_df),
+}
+```
+
+`maintain_order="none"` is the join default for both engines; the in-memory
+engine just happens to keep the left order. Code that relied on that accident
+breaks when it moves from eager to lazy. dplyr's `left_join()` keeps `x`'s
+row order. (duckplyr's documentation gives the same warning about DuckDB:
+results are not ordered.)
+
+| Operation | Order under streaming | Ask for order with |
+|---|---|---|
+| `filter`, `select`, `with_columns`, `sort` | preserved | |
+| `join` | none by default | `maintain_order="left"` (or `"right"`, `"left_right"`, …) |
+| `group_by().agg()` | none, in either engine | `group_by(..., maintain_order=True)` or `.sort()` |
+| `unique()` | none, in either engine | `unique(maintain_order=True)` |
+| `unpivot()` | reordered under streaming | `.sort()` afterwards; there is no parameter |
+| `sink_*()` | preserved by default | `maintain_order=False` is slightly faster |
+
+: Who keeps row order {.striped}
+
+#### Other ways to run a plan
+
+| Call | Returns | Notes |
+|---|---|---|
+| `lf.collect()` | `DataFrame` | |
+| `lf.collect(background=True)` | `InProcessQuery`: `.fetch()` (None until done), `.fetch_blocking()`, `.cancel()` | unstable |
+| `await lf.collect_async()` | `DataFrame` | for asyncio code |
+| `lf.collect_batches(chunk_size=)` | an iterator of `DataFrame`s | unstable; slower than a sink |
+| `pl.collect_all([lf1, lf2])` | a list of `DataFrame`s | shares common subplans (@sec-lazy-recipes) |
+| `lf.sink_parquet()`, `sink_csv()`, `sink_ndjson()`, `sink_ipc()` | `None`; writes files | `lazy=True` returns a plan for `collect_all` |
+| `lf.cache()` | a `LazyFrame` with a `CACHE` node | the docs say the optimizer usually does better |
+
+: Running a plan {.striped}
+
+### A measured example {#sec-lazy-measured}
+
+A synthetic radiology worklist: 5 million exams over five years, with a
+fixed seed, written as Parquet partitioned by year (one directory per
+year, the *hive* layout `year=2025/`).
+
+```{python}
+rng = np.random.default_rng(2025)
+n_exams = 5_000_000
+
+exams_df_raw = pl.DataFrame({
+    "exam_id": np.arange(n_exams),
+    "exam_date": np.datetime64("2021-01-01")
+    + rng.integers(0, 5 * 365, n_exams).astype("timedelta64[D]"),
+    "site": rng.choice(["A", "B", "C", "D", "E", "F"], n_exams),
+    "modality": rng.choice(
+        ["XR", "CT", "US", "MR", "MG", "NM"], n_exams, p=[0.45, 0.2, 0.15, 0.1, 0.07, 0.03]
+    ),
+    "priority": rng.choice(["routine", "urgent", "stat"], n_exams, p=[0.7, 0.2, 0.1]),
+    "patient_age": rng.integers(0, 96, n_exams),
+    "n_images": rng.integers(1, 2000, n_exams),
+    "tat_min": rng.lognormal(4, 1, n_exams).round(1),   # report turnaround, minutes
+}).with_columns(
+    accession=pl.format("ACC{}", pl.col("exam_id").cast(pl.String).str.zfill(9)),
+    year=pl.col("exam_date").dt.year(),
+)
+
+exams_dir = data_dir / "exams"
+exams_df_raw.write_parquet(exams_dir, partition_by="year")
+del exams_df_raw
+
+sorted(str(p.relative_to(data_dir)) for p in exams_dir.rglob("*.parquet"))
+```
+
+The question: median turnaround of 2025 stat exams, by modality.
+
+```{python}
+exams_lf = pl.scan_parquet(exams_dir)   # a directory: hive partitions detected
+
+stat_tat_lf = (
+    exams_lf
+    .filter(pl.col("year") == 2025, pl.col("priority") == "stat")
+    .group_by("modality")
+    .agg(n=pl.len(), tat_median=pl.col("tat_min").median())
+    .sort("modality")
+)
+show_plan(stat_tat_lf)
+```
+
+The scan lists **one file**: the four other years were pruned from the
+directory names alone (`year` comes from the path, so no file had to be
+opened to rule it out). Within that file, 4 of 10 columns are read. The
+eager version has no such option:
+
+```{python}
+def stat_tat_eager() -> pl.DataFrame:
+    exams_df = pl.read_parquet(exams_dir)               # all 5 files, all 10 columns
+    return (
+        exams_df
+        .filter(pl.col("year") == 2025, pl.col("priority") == "stat")
+        .group_by("modality")
+        .agg(n=pl.len(), tat_median=pl.col("tat_min").median())
+        .sort("modality")
+    )
+
+
+assert_frame_equal(stat_tat_eager(), stat_tat_lf.collect())   # same answer
+stat_tat_lf.collect()
+```
+
+Now the timing, best of three runs each. **The numbers depend on the machine
+and change between renders**; the ratios are what to look at.
+
+```{python}
+def best_ms(f, runs: int = 3) -> float:
+    times = []
+    for _ in range(runs):
+        start = time.perf_counter()
+        f()
+        times.append(time.perf_counter() - start)
+    return round(min(times) * 1000, 1)
+
+
+timings = {
+    "eager: read all, then filter": best_ms(stat_tat_eager),
+    "read_parquet() alone": best_ms(lambda: pl.read_parquet(exams_dir)),
+    "lazy: collect()": best_ms(stat_tat_lf.collect),
+    "lazy: in-memory engine": best_ms(lambda: stat_tat_lf.collect(engine="in-memory")),
+}
+pl.DataFrame({"approach": list(timings), "ms": list(timings.values())}).with_columns(
+    vs_eager=(pl.col("ms").first() / pl.col("ms")).round(1)
+)
+```
+
+On this machine the lazy query is more than ten times faster, and both
+engines are about equal: the win comes from the plan, not the engine. The
+eager pipeline spends roughly half its time just reading, and it holds this
+much in memory before the filter removes 98% of it:
+
+```{python}
+f"{pl.read_parquet(exams_dir).estimated_size('mb'):.0f} MB"
+```
+
+The lazy query reads one fifth of the rows and two fifths of the columns,
+so it never builds that frame.
+
+### Eager vs lazy {#sec-lazy-when}
+
+Most eager verbs are already lazy queries of one step. In the 2.0 source,
+`DataFrame.filter()` is literally
+`self.lazy().filter(...)._collect_eager(...)`, and `join()`,
+`with_columns()` and the rest follow the same pattern: collected at once on
+the in-memory engine with the cross-step optimizations off (that is why the
+eager join above kept its order). So the choice is not between two engines
+but between letting the optimizer see one step or the whole query.
+
+| Situation | Use |
+|---|---|
+| exploring a frame that fits in memory, step by step | eager |
+| anything that starts from a file | `pl.scan_*()` … `.collect()` |
+| a pipeline of several steps, even on an in-memory frame | `df.lazy()` … `.collect()` (CSE, sort removal, top-k still apply) |
+| results that should go to disk | `sink_*()` instead of `collect()` + `write_*()` |
+| several outputs from the same input | `pl.collect_all()` |
+
+: Choosing {.striped}
+
+**Don't collect in the middle.** A `collect()` ends the plan: whatever comes
+after it can't be pushed back into the read.
+
+```{python}
+show_plan(flights_lf.collect().lazy().filter(pl.col("origin") == "JFK").select("carrier"))
+```
+
+The filter now runs over an in-memory `DF` holding all 19 columns that were
+already read; compare the `SELECTION` inside the scan in @sec-lazy-explain.
+
+**Methods that exist on only one side** (from comparing `dir()` in 2.0):
+
+- *Eager only:* `height`, `shape`, `item()`, `rows()`, `glimpse()`,
+  `sample()`, `transpose()`, `to_dummies()`, `partition_by()`, `upsample()`,
+  `is_duplicated()`, `write_*()`. They need the data or its size; collect
+  first.
+- *Lazy only:* `explain()`, `collect*()`, `sink_*()`, `cache()`,
+  `inspect()`, `pipe_with_schema()`, `show_graph()`.
+- *Different signature:* `pivot()` exists on both, but a `LazyFrame` must
+  know its output columns before it reads any data, and a pivot's columns
+  are data values. So lazily `on_columns=` is required:
+
+```{python}
+#| error: true
+flights_df.lazy().pivot("origin", index="carrier", values="dep_delay")
+```
+
+```{python}
+(
+    flights_df.lazy()
+    .pivot("origin", on_columns=["EWR", "JFK", "LGA"], index="carrier",
+           values="dep_delay", aggregate_function="len")
+    .sort("carrier")
+    .head(3)
+    .collect()
+)
+```
+
+dbplyr hits the same wall: its docs say `pivot_wider()` "cannot be lazy
+because we need to look at the data to figure out what the new column names
+will be", and its escape hatch, a pre-built spec, plays the role of
+`on_columns=`. [Reshaping](../transform/reshape.qmd) covers `pivot()`
+itself.
+
+## Where it bites {#sec-lazy-gotchas}
+
+| Expectation from eager code or R | Lazy Polars behaviour |
+|---|---|
+| a pipeline returns data | it returns a `LazyFrame`; forget `collect()` and you hold a plan |
+| a typo fails on the line that has it | schema errors appear at `collect_schema()` / `explain()` / `collect()` |
+| a bad value fails on the line that has it | data errors appear only at `collect()`, and only if the step runs |
+| `left_join()` keeps the left row order | streaming joins don't, unless `maintain_order=` (@sec-lazy-order) |
+| eager and lazy results are identical | float aggregates can differ in the last bits; compare with `assert_frame_equal` |
+| a Python function is just another step | UDFs block some pushdowns |
+| `collect(streaming=True)`, `collect(predicate_pushdown=False)` from older tutorials | `ArgumentRemovedError` in 2.0: use `engine="streaming"`, `optimizations=pl.QueryOptFlags(...)` |
+| `lf.profile()` from older tutorials | removed in 2.0 |
+| `lf.describe()` is cheap metadata | it runs the whole plan and returns a `DataFrame` |
+| `lf.columns`, `lf.schema` | work, but warn (`PerformanceWarning`): use `lf.collect_schema()` |
+
+: The differences at a glance {.striped}
+
+### Forgetting `collect()`
+
+A `LazyFrame` has no rows to index:
+
+```{python}
+#| error: true
+jfk_late_lf["carrier"]
+```
+
+`len(lf)`, `lf.height` and `lf.write_parquet()` fail the same way. The
+fix is always the same: add `.collect()` (or use `sink_parquet()`).
+
+### Errors arrive late {#sec-lazy-errors}
+
+Building a plan checks nothing. A typo passes silently until something
+resolves the schema:
+
+```{python}
+#| error: true
+typo_lf = flights_df.lazy().select("carier")   # no error here …
+typo_lf.collect_schema()                        # … only here
+```
+
+`collect_schema()` resolves names and dtypes without reading data, so it
+catches typos and type mismatches cheaply. It can't catch errors that depend
+on the values:
+
+```{python}
+cast_lf = flights_df.lazy().with_columns(carrier_code=pl.col("carrier").cast(pl.Int64))
+cast_lf.collect_schema()["carrier_code"]   # the plan type-checks
+```
+
+```{python}
+#| error: true
+cast_lf.collect()
+```
+
+The count in the message covers only the batch that failed, not the whole
+column; the in-memory engine reports all 336,776 rows. And a broken step
+whose output nobody uses never runs at all, because projection pushdown
+removes it:
+
+```{python}
+cast_lf.select("year").head(1).collect()
+```
+
+### Python UDFs block pushdown
+
+`map_elements()` runs a Python function per value; `map_batches()` runs one
+on a whole Series. The optimizer can't see inside either, and treats them
+differently:
+
+```{python}
+delay_hr_elements = pl.col("dep_delay").map_elements(
+    lambda m: round(m / 60, 1), return_dtype=pl.Float64
+)
+delay_hr_batches = pl.col("dep_delay").map_batches(
+    lambda s: (s / 60).round(1), return_dtype=pl.Float64
+)
+for udf in [delay_hr_elements, delay_hr_batches]:
+    show_plan(
+        flights_lf.with_columns(delay_hr=udf)
+        .filter(pl.col("origin") == "JFK")
+        .select("delay_hr")
+    )
+    print("---")
+```
+
+With `map_elements()` (element-wise, so filtering first changes nothing),
+the filter still reaches the scan. With `map_batches()` the function might
+depend on the whole batch, so the filter has to wait above it: the UDF runs
+on all 336,776 rows instead of the 111,279 JFK flights. `LazyFrame.map_batches()`
+is stronger still: it becomes an `OPAQUE_PYTHON` node that blocks both
+pushdowns unless you pass `predicate_pushdown=True` /
+`projection_pushdown=True`, and it assumes the schema is unchanged unless
+you pass `schema=`. Native expressions avoid all of this.
+
+## Recipes {#sec-lazy-recipes}
+
+**Inspect a big file cheaply.** The schema and a few rows, without loading
+the data (`exams_lf.select(pl.len()).collect().item()` adds the row count):
+
+```{python}
+exams_lf.collect_schema()
+```
+
+```{python}
+exams_lf.head(3).collect()
+```
+
+For CSV, `collect_schema()` infers dtypes from the first
+`infer_schema_length` rows (100 by default), so it is cheap but can guess
+wrong.
+
+**Filter a partitioned dataset by partition.** Any filter on the hive key
+prunes directories, including ranges:
+
+```{python}
+show_plan(exams_lf.filter(pl.col("year") >= 2024).select(pl.len()))
+```
+
+**Write results without materializing them** (≈ `arrow::write_dataset(partitioning = "origin")`).
+`sink_parquet()` streams batches to disk; with `pl.PartitionBy` it writes
+the hive layout itself:
+
+```{python}
+(
+    flights_lf
+    .filter(pl.col("dep_delay") > 0)
+    .sink_parquet(pl.PartitionBy(data_dir / "late_by_origin", key="origin"), mkdir=True)
+)
+sorted(str(p.relative_to(data_dir)) for p in (data_dir / "late_by_origin").rglob("*.parquet"))
+```
+
+The result never exists as a `DataFrame` in Python. `PartitionBy` is marked
+unstable.
+
+**Compute two summaries in one pass.** Two queries that share a scan and a
+filter, collected together:
+
+```{python}
+jfk_by_carrier_lf = jfk_flights_lf.group_by("carrier").agg(n=pl.len())
+jfk_by_dest_lf = jfk_flights_lf.group_by("dest").agg(avg_delay=pl.col("dep_delay").mean())
+
+show_plan(pl.explain_all([jfk_by_carrier_lf, jfk_by_dest_lf]))
+
+jfk_by_carrier_df, jfk_by_dest_df = pl.collect_all([jfk_by_carrier_lf, jfk_by_dest_lf])
+jfk_by_carrier_df.shape, jfk_by_dest_df.shape
+```
+
+`pl.explain_all()` shows the shared `CACHE`: the file is scanned and filtered
+once. Two separate `collect()` calls would do both twice.
+
+```{python}
+#| include: false
+tmp.cleanup()
+```
+
+## See also {#sec-lazy-see-also}
+
+- Cheatsheet: [Lazy API](../overview/polars-cheatsheet.qmd#sec-cs-lazy) ·
+  [Import, Export & Inspect](../overview/polars-cheatsheet.qmd#sec-cs-io)
+- Earlier: [Overview: Eager vs Lazy](../overview/polars-overview.qmd#sec-ov-lazy) ·
+  [Data Model](../core/data-model.qmd) (the three containers) ·
+  [Expressions & Contexts](../core/expressions.qmd#sec-expr-parallel) (CSE)
+- Order under streaming in depth: [Joins](../transform/joins.qmd) ·
+  [Grouping & Aggregation](../transform/group-agg.qmd) ·
+  [Reshaping](../transform/reshape.qmd) (lazy `pivot()`)
+- Polars user guide: [Lazy API](https://docs.pola.rs/user-guide/lazy/) ·
+  [Optimizations](https://docs.pola.rs/user-guide/lazy/optimizations/) ·
+  [Query plan](https://docs.pola.rs/user-guide/lazy/query-plan/) ·
+  [Streaming](https://docs.pola.rs/user-guide/concepts/streaming/) ·
+  [Hive partitioning](https://docs.pola.rs/user-guide/io/hive/)
+- Python API: [LazyFrame](https://docs.pola.rs/api/python/stable/reference/lazyframe/index.html) ·
+  [`QueryOptFlags`](https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.QueryOptFlags.html)
+- R side: [Introduction to dbplyr](https://dbplyr.tidyverse.org/articles/dbplyr.html) ·
+  [arrow: Working with multi-file datasets](https://arrow.apache.org/docs/r/articles/dataset.html) ·
+  [duckplyr](https://duckplyr.tidyverse.org/)

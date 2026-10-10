@@ -1,0 +1,622 @@
+---
+title: "Missing Values"
+subtitle: "≈ `NA` · `is.na()` · `replace_na()` · `fill()` · `complete()`"
+jupyter: python3
+---
+
+R has one missing marker, `NA`, and treats `NaN` as a kind of `NA`. Polars has
+two unrelated things: **null**, a missing value in any dtype, and **`NaN`**, an
+ordinary float value. Null tools ignore `NaN`, and aggregations skip nulls
+without being asked. This chapter covers how each one arises and propagates,
+how to count, fill and drop them, and how to find rows that are missing
+entirely.
+
+## In tidyverse {#sec-na-tidyverse}
+
+```r
+library(tidyverse)
+
+x <- c(1, NA, 0 / 0)          # NA and NaN in one double vector
+is.na(x)                      # FALSE TRUE TRUE: NaN counts as missing
+mean(x)                       # NA: R makes you decide
+mean(x, na.rm = TRUE)         # 1: na.rm drops NA *and* NaN
+
+df |> mutate(y = replace_na(y, 0), z = na_if(z, -999), w = coalesce(a, b))
+df |> group_by(id) |> fill(dose, .direction = "down")
+stocks |> complete(year, qtr)                        # implicit → explicit
+flights |> distinct(tailnum) |> anti_join(planes)    # find implicit gaps
+```
+
+R's rule: missingness is contagious. Arithmetic, comparisons and summaries all
+return `NA` until you opt out with `na.rm = TRUE`. Polars keeps contagion for
+element-wise operations but **not** for aggregations, and it never treats `NaN`
+as missing.
+
+## Mental model {#sec-na-model}
+
+```text
+  A Float64 column holding [1.0, null, NaN]
+
+  values   │ 1.0 │  ·  │ NaN │
+  validity │  1  │  0  │  1  │      null = validity bit 0; NaN = a valid float value
+
+                  null                                  NaN
+  dtypes          every dtype                           Float16 / Float32 / Float64 only
+  comes from      None, empty CSV field, failed cast,   0/0, sqrt(-1), log(-1),
+                  shift(), outer joins, pivot gaps      "NaN" in a CSV float column
+  detect          is_null()                             is_nan()       (null → null)
+  aggregations    skipped                               propagate: mean, sum → NaN
+  equality        null == null → null                   NaN == NaN → true
+  R analog        NA                                    NaN, but R's is.na(NaN) is TRUE
+```
+
+The validity bit is explained in [Data Model](../core/data-model.qmd#sec-dm-model).
+Each tool family sees only its own kind:
+
+| Task | null | `NaN` |
+|---|---|---|
+| detect | `is_null()`, `is_not_null()` | `is_nan()`, `is_not_nan()` |
+| count | `null_count()` | `is_nan().sum()` |
+| replace | `fill_null()` | `fill_nan()` |
+| drop rows | `drop_nulls()` | `drop_nans()` |
+| convert | — | `fill_nan(None)` turns `NaN` into null |
+
+: Two markers, two tool families {.striped}
+
+## Mechanics {#sec-na-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import datetime as dt
+
+import polars as pl
+import polars.selectors as cs
+from pl_notes import datasets
+
+penguins_df = datasets.penguins()
+flights_df = datasets.flights()
+weather_df = datasets.weather()
+planes_df = datasets.planes()
+airports_df = datasets.airports()
+```
+
+### Null vs NaN {#sec-na-nan}
+
+`NaN` comes from float arithmetic that has no answer. Null comes from missing
+input, and passes through arithmetic as null:
+
+```{python}
+ratio_df = pl.DataFrame({"num": [0.0, -1.0, 1.0, None], "den": [0.0, 1.0, 0.0, 1.0]})
+
+ratio_df.with_columns(
+    ratio=pl.col("num") / pl.col("den"),
+    sqrt=pl.col("num").sqrt(),
+).with_columns(
+    is_null=pl.col("ratio").is_null(),
+    is_nan=pl.col("ratio").is_nan(),
+)
+```
+
+`1 / 0` is `inf`, not `NaN`. `is_nan()` of a null is null, not `false`.
+Integer `//` and `%` by zero give null rather than an error.
+
+In a CSV, an empty field is null, and the string `NaN` in a float column
+parses as `NaN`. Unlike readr (default `na = c("", "NA")`), Polars does not
+read `NA` as missing unless you pass `null_values="NA"`, which is what
+`pl_notes.datasets` does:
+
+```{python}
+pl.read_csv(b"reading,site\n1.5,A\nNaN,NA\n,B\n")
+```
+
+**A realistic `NaN`.** Each hour's share of the day's rainfall is
+`precip / daily total`. On a dry day that is `0 / 0`:
+
+```{python}
+weather_df_share = weather_df.with_columns(
+    precip_share=pl.col("precip") / pl.col("precip").sum().over("origin", "month", "day")
+)
+
+weather_df_share.select(
+    null_count=pl.col("precip_share").null_count(),
+    nan_count=pl.col("precip_share").is_nan().sum(),
+    mean=pl.col("precip_share").mean(),
+    mean_rainy=pl.col("precip_share").fill_nan(None).mean(),
+)
+```
+
+Two thirds of the column is `NaN`, `null_count()` reports zero, and one `NaN`
+poisons the mean. `fill_nan(None)` converts `NaN` to null, after which `mean()`
+skips them. In R, `is.na()` and `na.rm = TRUE` would have handled both.
+
+**`NaN` is a value with a place in the order.** Polars treats `NaN` as equal to
+itself and greater than `inf`, so it sorts and groups predictably. `max()`
+skips it, though, while `mean()` propagates it:
+
+```{python}
+x = pl.Series("x", [3.0, float("nan"), float("inf"), None, 1.0])
+{
+    "x == x": (x == x).to_list(),
+    "sort()": x.sort().to_list(),
+    "max(), nan_max()": (x.max(), x.nan_max()),
+    "mean()": x.mean(),
+    "n_unique()": x.n_unique(),
+}
+```
+
+In R, `NaN == NaN` is `NA`, `sort()` drops `NaN`, and `max(c(1, NaN))` is
+`NaN`.
+
+### How nulls propagate {#sec-na-propagation}
+
+Every row below was verified on Polars 2.0. `x` is a column with nulls.
+
+| Operation | Polars | R |
+|---|---|---|
+| `x + 1`, `x * 0`, `x ** 0` | null | `NA`, `NA`, but `NA^0` is `1` |
+| `x > 1`, `x == x` | null | `NA` |
+| `x.eq_missing(y)`, `x.ne_missing(y)` | null == null → `true`, never null | — |
+| `null & False`, `null | True` | `false`, `true` (Kleene logic) | same |
+| `null & True`, `null | False`, `~null` | null | same |
+| `x.sum()` | skips nulls; all-null → `0` | `sum(x, na.rm = TRUE)`; all-`NA` → `0` |
+| `x.mean()`, `median()`, `std()` | skip nulls; all-null → null | `mean(NA, na.rm = TRUE)` → `NaN` |
+| `x.min()`, `x.max()` | skip nulls; all-null → null | `max(NA, na.rm = TRUE)` → `-Inf` + warning |
+| `x.count()` / `x.len()` | non-null rows / all rows | `sum(!is.na(x))` / `n()` |
+| `x.n_unique()`, `unique()`, `group_by()` keys | null is one value, its own group | same |
+| `x.first()` | the first row, even if null; `ignore_nulls=True` skips | `first(x, na_rm = TRUE)` |
+| `x.cum_sum()` | null stays null, the sum carries on after it | `cumsum()` is `NA` from there on |
+| `x.any()`, `x.all()` | skip nulls (`ignore_nulls=True` default) | Kleene: `any(c(FALSE, NA))` → `NA`, `any(c(TRUE, NA))` → `TRUE` |
+| `pl.any_horizontal()`, `pl.all_horizontal()` | Kleene logic, like `|` and `&` | `x | y`, `x & y` |
+| `pl.sum_horizontal()` | skips nulls; all-null → `0` | `rowSums(na.rm = TRUE)` |
+| `x.is_in(["a", None])` | null → null; `nulls_equal=True` → `true` | `NA %in% c("a", NA)` → `TRUE` |
+| `x.str.*` | null → null | same |
+| `pl.concat_str()` | any null input → null; `ignore_nulls=True` | `str_c()` → `NA`; `paste()` → `"NA"` |
+| `when(cond)` with null `cond` | falls through to `otherwise()` | `case_when()`: to `.default`; `if_else()`: `NA` |
+| `filter(cond)` with null `cond` | row dropped | same |
+| `sort()` | nulls **first**, in both directions | `arrange()`: `NA` last |
+| `join()` keys | null never matches null; `nulls_equal=True` | `na_matches = "na"`: `NA` matches `NA` |
+
+: Null propagation, operation by operation {.striped}
+
+**Kleene logic** treats null as "true or false, unknown". `null & False` is
+`false` whatever the unknown is, so the answer is known. R does exactly the
+same, so this is one place where R intuition is right:
+
+```{python}
+bool_df = pl.DataFrame({"a": [True, False, None]}, schema={"a": pl.Boolean})
+
+bool_df.join(bool_df.rename({"a": "b"}), how="cross").with_columns(
+    a_and_b=pl.col("a") & pl.col("b"),
+    a_or_b=pl.col("a") | pl.col("b"),
+    not_a=~pl.col("a"),
+).filter(pl.col("a").is_null()).sort("b", descending=True, nulls_last=True)
+```
+
+**Aggregations** on a column with one null and on a column with only nulls:
+
+```{python}
+agg_df = pl.DataFrame(
+    {"some_null": [1, None, 3], "all_null": [None, None, None]},
+    schema={"some_null": pl.Int64, "all_null": pl.Int64},
+)
+aggs = {
+    "sum": pl.all().sum(), "mean": pl.all().mean(), "max": pl.all().max(),
+    "first": pl.all().first(), "count": pl.all().count(), "len": pl.all().len(),
+    "n_unique": pl.all().n_unique(), "null_count": pl.all().null_count(),
+}
+pl.concat(   # one row per aggregation; cast to String so the rows stack
+    agg_df.select(pl.lit(name).alias("agg"), expr.cast(pl.String))
+    for name, expr in aggs.items()
+)
+```
+
+`sum()` of nothing is `0` (as in R with `na.rm = TRUE`), but `mean()` and
+`max()` of nothing are null, where R returns `NaN` and `-Inf`. `n_unique()`
+counts null as a value.
+
+**Element-wise functions** keep nulls in place, with two exceptions worth
+knowing: `cum_sum()` carries on after a null, and `is_in()` returns null for a
+null input:
+
+```{python}
+toy_df = pl.DataFrame({"n": [1, None, 3], "s": ["a", None, "c"], "t": ["A", "B", None]})
+
+toy_df.with_columns(
+    cum_sum=pl.col("n").cum_sum(),
+    is_in=pl.col("s").is_in(["a", None]),
+    is_in_eq=pl.col("s").is_in(["a", None], nulls_equal=True),
+    concat=pl.concat_str("s", "t", separator="-"),
+    concat_skip=pl.concat_str("s", "t", separator="-", ignore_nulls=True),
+)
+```
+
+**`when/then`** treats a null condition as not true, so the row gets the
+`otherwise()` value. The two penguins with no body mass become "light":
+
+```{python}
+penguins_df.with_columns(
+    size=pl.when(pl.col("body_mass_g") > 4000).then(pl.lit("heavy")).otherwise(pl.lit("light")),
+).filter(pl.col("body_mass_g").is_null()).select("species", "body_mass_g", "size")
+```
+
+`if_else(body_mass_g > 4000, "heavy", "light")` would give `NA`. Test
+`.is_null()` in the first branch if you need a separate label.
+
+**Joins** never match null keys, but they do match `NaN` keys, because `NaN`
+is a value (more in [Joins](../transform/joins.qmd)):
+
+```{python}
+left_df = pl.DataFrame({"key": [1.0, float("nan"), None], "left": ["a", "b", "c"]})
+right_df = pl.DataFrame({"key": [1.0, float("nan"), None], "right": ["x", "y", "z"]})
+
+left_df.join(right_df, on="key", how="inner")
+```
+
+`nulls_equal=True` adds the third row. dplyr matches `NA` to `NA` by default.
+
+### Counting and diagnosing {#sec-na-counting}
+
+`null_count()` on a frame is `colSums(is.na(df))`; a long, sorted version with
+percentages is in @sec-na-recipes. Per row, sum the `is_null()` flags
+horizontally (≈ `rowSums(is.na(df))`). Two penguins are missing every
+measurement and `sex`, and nine more are missing only `sex`:
+
+```{python}
+penguins_df.with_columns(n_missing=pl.sum_horizontal(pl.all().is_null())).group_by(
+    "n_missing"
+).len().sort("n_missing")
+```
+
+Also available: `has_nulls()` (a Boolean per column), `df.count()` (non-null
+counts), and `df.describe()`, which includes a `null_count` row. Missingness
+often has structure; the `flights` example is in @sec-na-mean-trap.
+
+### Filling {#sec-na-filling}
+
+`fill_null()` takes a value, an expression, or a `strategy=`:
+
+```{python}
+dose = pl.Series("dose", [None, 1, None, None, 4, None])
+
+pl.DataFrame(dose).with_columns(
+    forward=pl.col("dose").fill_null(strategy="forward"),           # tidyr fill() "down"
+    forward_1=pl.col("dose").fill_null(strategy="forward", limit=1),
+    backward=pl.col("dose").fill_null(strategy="backward"),         # "up"
+    mean=pl.col("dose").fill_null(strategy="mean"),
+    zero=pl.col("dose").fill_null(strategy="zero"),
+    linear=pl.col("dose").interpolate(),
+)
+```
+
+The strategies are `"forward"`, `"backward"`, `"min"`, `"max"`, `"mean"`,
+`"zero"` and `"one"`. `limit=` caps how many consecutive nulls a forward or
+backward fill crosses. Leading and trailing nulls stay null when there is
+nothing to carry. Note that `mean` is `2`, not `2.5`: see @sec-na-fill-dtype.
+
+**Fill within groups** (≈ `group_by(patient) |> fill(dose_mg)`). Forward
+filling follows row order, so if rows are not in time order, pass `order_by=`:
+
+```{python}
+visits_df = pl.DataFrame({
+    "patient": ["A", "B", "A", "B", "A", "B"],
+    "day": [1, 1, 3, 2, 2, 3],
+    "dose_mg": [10, None, None, 5, 20, None],
+})
+
+visits_df.with_columns(
+    by_row=pl.col("dose_mg").fill_null(strategy="forward").over("patient"),
+    by_day=pl.col("dose_mg").fill_null(strategy="forward").over("patient", order_by="day"),
+)
+```
+
+Patient A's day 3 is the third row. Filled in row order it takes day 1's
+`10`; filled in day order it takes day 2's `20`. Patient B's day 1 stays null
+because there is nothing before it.
+
+**Fill from another column** with `pl.coalesce()` (≈ `coalesce()`). The peak
+wind is the gust when one was recorded, otherwise the sustained speed:
+
+```{python}
+weather_df.select(
+    "origin", "time_hour", "wind_speed", "wind_gust",
+    peak_wind=pl.coalesce("wind_gust", "wind_speed"),
+).head(3)
+```
+
+`pl.coalesce("a", "b", 0)` adds a final constant. Bare strings are column
+names here; use `pl.lit()` for a string value (see
+[Expressions](../core/expressions.qmd#sec-expr-literals)).
+
+**Interpolate.** `interpolate()` assumes equally spaced rows (≈
+`zoo::na.approx()`). `interpolate_by()` uses an actual x axis, such as a
+time column:
+
+```{python}
+readings_df = pl.DataFrame({
+    "hour": [0, 1, 4, 5],
+    "temp": [10.0, None, None, 15.0],
+})
+
+readings_df.with_columns(
+    by_row=pl.col("temp").interpolate(),
+    by_hour=pl.col("temp").interpolate_by("hour"),
+)
+```
+
+`interpolate()` returns `Float64` even for an integer column, and it fills
+nulls only; `NaN` stays `NaN`.
+
+### Value → null, and dropping {#sec-na-dropping}
+
+Sentinel codes such as `-999` and `""` become null with `replace(old, None)`
+(≈ `na_if()`). `old` may be a list, and with selectors one call cleans many
+columns:
+
+```{python}
+survey_df_raw = pl.DataFrame({
+    "id": [1, 2, 3],
+    "temp": [21.5, -999.0, 22.1],
+    "count": [5, 7, -999],
+    "site": ["A", "", "N/A"],
+})
+
+survey_df_clean = survey_df_raw.with_columns(
+    cs.numeric().replace(-999, None),
+    cs.string().replace(["", "N/A"], None),
+)
+survey_df_clean
+```
+
+The dtypes are unchanged. To drop rows, `drop_nulls()` checks every column and
+`subset=` limits it (≈ `drop_na(body_mass_g)`); `drop_nans()` is the `NaN`
+twin and keeps nulls:
+
+```{python}
+{
+    "rows": penguins_df.height,
+    "drop_nulls()": penguins_df.drop_nulls().height,
+    "drop_nulls(subset='body_mass_g')": penguins_df.drop_nulls(subset="body_mass_g").height,
+    "drop_nans() on precip_share": weather_df_share.drop_nans().height,
+}
+```
+
+### Explicit vs implicit missing {#sec-na-implicit}
+
+R4DS separates two kinds of missing data. An **explicit** missing value is a
+null in a row that exists. An **implicit** missing value is a row that should
+exist but doesn't. Every tool so far only sees explicit nulls.
+
+```text
+ stocks (7 rows)              pivot(on="qtr")                complete(year, qtr)
+ year qtr price               year   1     2     3     4     2020 4 null  ← explicit
+ 2020  4  null  ← explicit    2020  1.88  0.59  0.35  null   2021 1 null  ← was implicit
+ (2021 Q1 has no row)         2021  null  0.92  0.17  2.66
+```
+
+`complete()` is a cross join of the key values plus a left join back. A flag
+column added before the join records which rows were observed, so the two kinds
+stay distinguishable afterwards:
+
+```{python}
+stocks_df = pl.DataFrame({
+    "year": [2020, 2020, 2020, 2020, 2021, 2021, 2021],
+    "qtr": [1, 2, 3, 4, 2, 3, 4],
+    "price": [1.88, 0.59, 0.35, None, 0.92, 0.17, 2.66],
+})
+
+stocks_df_complete = (
+    stocks_df.select("year").unique()
+    .join(stocks_df.select("qtr").unique(), how="cross")
+    .join(stocks_df.with_columns(observed=pl.lit(True)), on=["year", "qtr"], how="left")
+    .sort("year", "qtr")
+)
+stocks_df_complete.filter(pl.col("price").is_null())
+```
+
+The reverse, explicit → implicit, is `drop_nulls()` (≈ `pivot_longer(...,
+values_drop_na = TRUE)`). Pivoting is covered in
+[Reshaping](../transform/reshape.qmd).
+
+**Find the gaps with an anti-join.** `weather` should have one row per airport
+per hour of 2013. `complete()` only knows values that appear somewhere, so a
+full calendar has to come from outside the data (≈ `full_seq()`):
+
+```{python}
+hours_df = pl.DataFrame({
+    "time_hour": pl.datetime_range(
+        dt.datetime(2013, 1, 1), dt.datetime(2013, 12, 31, 23),
+        interval="1h", time_zone="America/New_York", eager=True,
+    )
+})
+weather_grid_df = weather_df.select("origin").unique().join(hours_df, how="cross")
+
+weather_df_gaps = weather_grid_df.join(weather_df, on=["origin", "time_hour"], how="anti")
+weather_df_gaps.group_by("origin").len().sort("origin")
+```
+
+That is 165 missing station-hours. At every station the data starts at 01:00
+on 1 January and ends at 18:00 on 30 December, so 30 of each station's gaps
+sit at the edges of the year. To fill the gaps, make them explicit with a left
+join, then interpolate along time within each station:
+
+```{python}
+weather_df_hourly = (
+    weather_grid_df.join(weather_df, on=["origin", "time_hour"], how="left")
+    .sort("origin", "time_hour")
+    .with_columns(temp_filled=pl.col("temp").interpolate_by("time_hour").over("origin"))
+)
+weather_df_hourly.select(
+    temp_nulls=pl.col("temp").null_count(),
+    temp_filled_nulls=pl.col("temp_filled").null_count(),
+)
+```
+
+`temp` now has 166 nulls: the 165 new rows plus one that was already explicit.
+The 90 left after interpolating are those 30 edge hours per station, because
+interpolation needs a value on both sides.
+
+**Keys in one table, missing from another.** The R4DS examples translate
+directly. Four destinations are missing from `airports`, and 722 tail numbers
+(one of them null) are missing from `planes`:
+
+```{python}
+{
+    "dest not in airports": flights_df.select("dest").unique()
+    .join(airports_df, left_on="dest", right_on="faa", how="anti")
+    .sort("dest")["dest"].to_list(),
+    "tailnum not in planes": flights_df.select("tailnum").unique()
+    .join(planes_df, on="tailnum", how="anti").height,
+}
+```
+
+The null tail number shows up because a null key matches nothing. In this
+case dplyr gives the same count, since `planes` has no `NA` key to match.
+
+**Empty groups** are implicit missing rows too. `group_by()` on an `Enum`
+returns only the levels that occur (there is no `.drop = FALSE`); to keep the
+others, left-join the summary onto a frame of all levels, built from
+`dtype.categories`.
+
+## Where it bites {#sec-na-gotchas}
+
+| R behaviour | Polars behaviour |
+|---|---|
+| `is.na(NaN)` is `TRUE`; `na.rm` drops `NaN` | `NaN` is not null; null tools ignore it (@sec-na-nan) |
+| `mean(x)` with an `NA` → `NA` | `mean()` skips nulls silently |
+| `filter(x)` and `filter(!x)` both drop `NA` rows | the same with `~`: null rows are in neither half |
+| `replace_na()` refuses the wrong type | `fill_null()` can change the dtype |
+| `any(c(FALSE, NA))` → `NA` | `.any()` → `false`, but `any_horizontal()` → null |
+
+: Traps at a glance (the rest are in the propagation table, @sec-na-propagation) {.striped}
+
+Kleene `&` and `|` and nulls forming their own group are also the same in
+both languages.
+
+### `mean()` hides how many rows it used {#sec-na-mean-trap}
+
+R's `NA` result forces a decision. Polars just answers, so check `count()`
+against `len()` when the nulls carry meaning. In `flights`, a null `dep_time`
+means a cancelled flight:
+
+```{python}
+flights_df.select(
+    n=pl.len(),
+    cancelled=pl.col("dep_time").is_null().sum(),
+    n_used=pl.col("arr_delay").count(),
+    mean_arr_delay=pl.col("arr_delay").mean(),
+)
+```
+
+The mean uses 327,346 of 336,776 flights. It silently drops the 8,255
+cancellations and 1,175 more flights that departed but have no recorded
+arrival delay.
+
+### A filter and its negation don't cover all rows {#sec-na-filter-trap}
+
+`filter()` drops rows where the condition is null, and `~null` is still null.
+The two penguins with no body mass are in neither half:
+
+```{python}
+heavy = pl.col("body_mass_g") > 4000
+{
+    "heavy": penguins_df.filter(heavy).height,
+    "~heavy": penguins_df.filter(~heavy).height,
+    "total": penguins_df.height,
+}
+```
+
+dplyr's `filter()` behaves the same. To keep them, write the complement
+explicitly: `~heavy | pl.col("body_mass_g").is_null()`. Similarly,
+`filter(pl.col("x").is_not_nan())` drops nulls as well as `NaN`, because
+`is_not_nan()` of a null is null; `drop_nans()` keeps them.
+
+### `fill_null()` and dtypes {#sec-na-fill-dtype}
+
+`replace_na()` refuses a value of the wrong type. `fill_null()` on an
+expression finds a common dtype instead:
+
+```{python}
+int_df = pl.DataFrame({"n": [1, 4, None], "s": ["a", "b", None]})
+
+int_df.with_columns(
+    mean_strategy=pl.col("n").fill_null(strategy="mean"),   # Int64: 2.5 truncated to 2
+    mean_expr=pl.col("n").fill_null(pl.col("n").mean()),     # Float64: 2.5
+    n_as_text=pl.col("n").fill_null("missing"),              # Int64 becomes String
+)
+```
+
+The frame-level `int_df.fill_null(0)` behaves differently again: it fills only
+the columns whose dtype fits the value (`n`, not `s`), so
+`df.fill_null(0)` is a safe "numeric columns only" shortcut.
+
+### `.any()` and `any_horizontal()` disagree {#sec-na-any-trap}
+
+Column-wise `.any()` and `.all()` skip nulls by default; the row-wise versions
+use Kleene logic. With `b` all null:
+
+```{python}
+flags_df = pl.DataFrame(
+    {"a": [False, True], "b": [None, None]}, schema={"a": pl.Boolean, "b": pl.Boolean}
+)
+flags_df.with_columns(
+    b_any=pl.col("b").any(),                           # nulls skipped → false
+    b_any_kleene=pl.col("b").any(ignore_nulls=False),  # R's any(c(NA, NA)) → NA
+    a_or_b=pl.any_horizontal("a", "b"),                # false | null → null
+)
+```
+
+## Recipes {#sec-na-recipes}
+
+**Missingness summary per column**, long and sorted (≈ `naniar::miss_var_summary()`):
+
+```{python}
+weather_df.null_count().unpivot(variable_name="column", value_name="n_missing").with_columns(
+    pct_missing=(pl.col("n_missing") / weather_df.height * 100).round(1)
+).filter(pl.col("n_missing") > 0).sort("n_missing", descending=True)
+```
+
+**Cancelled flights by scheduled hour** (R4DS: `mean(is.na(dep_time))`). The
+mean of a Boolean is the share of `true`:
+
+```{python}
+flights_df.group_by(hour=pl.col("sched_dep_time") // 100).agg(
+    n=pl.len(),
+    prop_cancelled=pl.col("dep_time").is_null().mean(),
+    mean_dep_delay=pl.col("dep_delay").mean(),
+).filter(pl.col("hour") > 1).sort("prop_cancelled", descending=True).head(4)
+```
+
+`mean_dep_delay` covers only the flights that left, because nulls are skipped.
+
+**Flag before you fill**, so imputed values stay identifiable:
+
+```{python}
+penguins_df.with_columns(
+    mass_imputed=pl.col("body_mass_g").is_null(),
+    body_mass_g=pl.col("body_mass_g").fill_null(pl.col("body_mass_g").mean().over("species")),
+).filter(pl.col("mass_imputed")).select("species", "body_mass_g", "mass_imputed")
+```
+
+Both expressions read the original column, because expressions in one context
+run in parallel ([Expressions](../core/expressions.qmd#sec-expr-parallel)).
+
+## See also {#sec-na-see-also}
+
+- Cheatsheet:
+  [Missing Values](../overview/polars-cheatsheet.qmd#sec-cs-missing) ·
+  [Reshape](../overview/polars-cheatsheet.qmd#sec-cs-reshape) (`complete()`) ·
+  [Gotchas at a Glance](../overview/polars-cheatsheet.qmd#sec-cs-gotchas)
+- Related: [Data Model](../core/data-model.qmd) (the validity bitmap,
+  `cast(strict=False)` as a source of nulls) ·
+  [Expressions & Contexts](../core/expressions.qmd) (`is None` and `== None`) ·
+  [Joins](../transform/joins.qmd) (`nulls_equal=`) ·
+  [Reshaping](../transform/reshape.qmd) ·
+  [Window Functions](../transform/window.qmd) (`.over(order_by=)`)
+- Polars user guide: [Missing data](https://docs.pola.rs/user-guide/expressions/missing-data/)
+- Python API: [`fill_null`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.fill_null.html) ·
+  [`interpolate_by`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.interpolate_by.html)
+- R4DS 2e: [Missing values](https://r4ds.hadley.nz/missing-values.html)

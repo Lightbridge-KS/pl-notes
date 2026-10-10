@@ -1,0 +1,628 @@
+---
+title: "Row & Column Verbs"
+subtitle: "≈ dplyr single-table verbs: `filter()` · `arrange()` · `distinct()` · `slice_*()` · `select()` · `rename()` · `relocate()`"
+jupyter: python3
+---
+
+R4DS's *Data transformation* chapter teaches dplyr's single-table verbs on
+`flights`. This chapter follows the same path in Polars. The one-line
+translations are in the cheatsheet; this chapter covers the defaults that
+differ: where nulls go, which row survives a tie, what order rows come back
+in, and which column verbs change a frame in place.
+
+## In tidyverse {#sec-verb-tidyverse}
+
+```r
+library(dplyr)
+library(nycflights13)
+
+flights |> filter(dep_delay > 120, month == 1)
+flights |> arrange(month, day, desc(dep_delay))
+flights |> distinct(origin, dest, .keep_all = TRUE)
+flights |> slice_max(distance, n = 3)             # 342 rows: ties are kept
+flights |> slice_sample(prop = 1)                 # every row, shuffled
+flights |> select(year:day, tail_num = tailnum)
+flights |> relocate(starts_with("arr"), .before = dep_time)
+```
+
+dplyr makes promises about order and ties without being asked:
+
+1. `arrange()` keeps tied rows in input order and puts `NA` last, in both
+   directions.
+2. `filter()` and `distinct()` keep rows in input order; `distinct()` keeps
+   the first copy.
+3. `slice_max()` and `slice_min()` keep ties.
+
+Polars keeps `filter()`'s order and makes the rest opt-in. The docstrings give
+the reason: preserving order "is more expensive to compute", and leaving the
+choice of row open "allows more optimizations".
+
+## Mental model {#sec-verb-model}
+
+```text
+ ROW VERBS: change the height, never touch a column     order of the result
+ ─────────────────────────────────────────────────      ─────────────────────────────────────────
+ by predicate  filter(p)  remove(p)                     input order
+ by position   head tail slice gather gather_every      input order (by definition)
+ by value      sort(by)                                 tied rows: input order only with maintain_order=True
+               top_k(k, by)  bottom_k(k, by)            exactly k rows; ties broken arbitrarily
+ by identity   unique(subset, keep)                     arbitrary unless maintain_order=True
+ by chance     sample(n | fraction, seed)               arbitrary unless shuffle=True / False
+
+ COLUMN VERBS: change the width, never touch a row
+ ─────────────────────────────────────────────────
+ select  drop  rename  with_columns  with_row_index     return a new frame
+ insert_column   df.columns = [...]                     modify the frame in place (!)
+```
+
+Read the right-hand column as the contract. Anything marked "arbitrary" can
+differ between runs, and the fix is always an explicit argument
+(@sec-verb-gotchas).
+
+## Mechanics {#sec-verb-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import polars as pl
+import polars.selectors as cs
+from pl_notes import datasets
+
+flights_df = datasets.flights()    # 336,776 × 19, as nycflights13::flights
+penguins_df = datasets.penguins()
+```
+
+### Filter rows {#sec-verb-filter}
+
+Comma-separated predicates are combined with AND, as in dplyr. Equality tests
+also have a keyword shorthand: each `name=value` becomes
+`pl.col(name) == value`. In R, `filter(month = 1)` is the classic typo that
+dplyr rejects; in Polars it is valid:
+
+```{python}
+flights_df.filter(pl.col("dep_delay") > 120, month=1, origin="JFK").select(
+    "month", "day", "origin", "dest", "dep_delay"
+).head(3)
+```
+
+The shorthand is only `==`. `origin=["JFK", "LGA"]` raises (use
+`pl.col("origin").is_in(...)`), and `tailnum=None` compares with null, so it
+keeps no rows (Polars warns).
+
+**Nulls drop the row.** A row is kept only where the predicate is `true`;
+`false` and null both drop it, as in dplyr. So `filter(p)` and `filter(~p)` do
+not add up to the whole frame: rows where `p` is null are in neither.
+`remove(p)` is the exact complement of `filter(p)`. It drops the rows where
+`p` is `true` and keeps everything else, nulls included:
+
+```{python}
+late = pl.col("dep_delay") > 0
+{
+    "filter(late)": flights_df.filter(late).height,
+    "filter(~late)": flights_df.filter(~late).height,
+    "remove(late)": flights_df.remove(late).height,   # ~late plus the null rows
+    "all rows": flights_df.height,
+}
+```
+
+The 8,255 cancelled flights (null `dep_delay`) are only in `remove()`. In
+dplyr the same complement is `filter(!(dep_delay > 0) | is.na(dep_delay))`.
+Grouped filters such as `filter(n() > 1000, .by = dest)` are window
+expressions: `pl.len().over("dest") > 1000` (see
+[Window Functions](window.qmd)).
+
+### Sort rows {#sec-verb-sort}
+
+`sort()` takes several keys. `descending=` and `nulls_last=` each take one
+bool for all keys, or a list with one bool per key; a list of the wrong length
+raises a `ValueError`. This is `arrange(month, day, desc(dep_delay))` with
+`NA` last:
+
+```{python}
+flights_df.sort(
+    "month", "day", "dep_delay",
+    descending=[False, False, True],
+    nulls_last=True,
+).select("month", "day", "dep_delay", "carrier", "flight").head(3)
+```
+
+Without `nulls_last=True`, nulls come first in both directions
+(@sec-verb-nulls-first). Keys can also be expressions
+([Expressions & Contexts](../core/expressions.qmd#sec-expr-contexts)).
+
+**What "sorted" means for each dtype.** Numbers and dates sort by value.
+Strings sort by code point: digits before letters, every uppercase letter
+before every lowercase one, `"10"` before `"9"`. That matches `arrange()` in
+dplyr ≥ 1.1, which uses the C locale by default (base R's `sort()` uses the
+system locale). A `Categorical` sorts by its strings; an `Enum` sorts by its
+level order, like a factor:
+
+```{python}
+words = pl.Series(["banana", "Apple", "apple", "Banana", "10", "9"])
+{
+    "String": words.sort().to_list(),
+    "Categorical": words.cast(pl.Categorical).sort().to_list(),
+    "Enum": words.cast(pl.Enum(["9", "10", "apple", "Apple", "banana", "Banana"])).sort().to_list(),
+}
+```
+
+For a case-insensitive order, sort by an expression:
+`sort(pl.col("word").str.to_lowercase())`.
+
+### Distinct rows {#sec-verb-unique}
+
+`unique(subset=...)` decides what a duplicate is from the `subset` columns
+but always returns **every** column: it is `distinct(..., .keep_all = TRUE)`.
+For `distinct(origin, dest)`, which keeps only those two, select first:
+`select("origin", "dest").unique()`. `keep=` chooses which copy survives:
+
+```{python}
+sightings_df = pl.DataFrame({
+    "tailnum": ["N1", "N2", "N1", "N3", "N2", "N1"],
+    "seen":    [1, 2, 3, 4, 5, 6],
+})
+{
+    keep: sightings_df.unique("tailnum", keep=keep, maintain_order=True).rows()
+    for keep in ["first", "last", "none", "any"]
+}
+```
+
+- `"first"` is `distinct(.keep_all = TRUE)`.
+- `"last"` keeps the last copy, and `maintain_order=True` orders rows by where
+  that copy sat: `N3` (row 4), `N2` (row 5), `N1` (row 6).
+- `"none"` drops every repeated key (≈ `filter(n() == 1, .by = tailnum)`).
+- `"any"`, the **default**, promises nothing about which copy survives. Here it
+  picked the first ones; don't rely on that (@sec-verb-unique-defaults).
+
+Null keys count as equal to each other, as in `distinct()`. `subset=` also
+accepts expressions, so you can deduplicate on a computed key without adding it
+as a column. The first penguin in each 1 kg mass band, the null band included:
+
+```{python}
+penguins_df.unique(
+    subset=(pl.col("body_mass_g") / 1000).floor(), keep="first", maintain_order=True
+).select("species", "island", "body_mass_g")
+```
+
+(The integer key `pl.col("body_mass_g") // 1000` would be more natural, but as
+a `subset=` it panics in Polars 2.0.0, an engine bug. `// pl.lit(1000,
+dtype=pl.Int64)` works.)
+
+**Flag instead of filter.** Four expressions mark duplicates without
+removing them:
+
+```{python}
+sightings_df.with_columns(
+    is_duplicated=pl.col("tailnum").is_duplicated(),          # every copy of a repeated key
+    is_first_distinct=pl.col("tailnum").is_first_distinct(),  # !duplicated(tailnum)
+    is_last_distinct=pl.col("tailnum").is_last_distinct(),    # !duplicated(tailnum, fromLast = TRUE)
+    is_unique=pl.col("tailnum").is_unique(),                  # keys seen exactly once
+)
+```
+
+For a key of several columns, wrap them in a struct:
+`pl.struct("origin", "dest").is_first_distinct()`. `df.is_duplicated()` flags
+whole-row duplicates.
+
+**Counting** (≈ `n_distinct()`): `flights_df.n_unique(subset=["origin", "dest"])`
+returns a Python `int` (224 routes); the expression `pl.col("dest").n_unique()`
+works in any context; `approx_n_unique()` estimates with HyperLogLog++ when an
+exact count is too expensive.
+
+### Rows by position {#sec-verb-slice}
+
+Positions are 0-based, and a negative position counts from the end. That is
+Python's convention, not R's: in R a negative index **drops** rows. In
+`slice(offset, length)`, a negative offset starts from the end, a negative
+length stops that many rows before the end, and no length runs to the end:
+
+```{python}
+positions_df = pl.DataFrame({"i": range(10)})
+{
+    "slice(2, 3)": positions_df.slice(2, 3)["i"].to_list(),      # slice(3:5)
+    "slice(-3)": positions_df.slice(-3)["i"].to_list(),          # slice_tail(n = 3)
+    "slice(2, -3)": positions_df.slice(2, -3)["i"].to_list(),
+    "slice(8, 5)": positions_df.slice(8, 5)["i"].to_list(),      # past the end: clipped
+    "head(-3)": positions_df.head(-3)["i"].to_list(),            # slice_head(n = -3)
+    "tail(-3)": positions_df.tail(-3)["i"].to_list(),            # slice_tail(n = -3)
+    "gather([0, 3, -1])": positions_df.gather([0, 3, -1])["i"].to_list(),  # slice(c(1, 4, n()))
+    "gather_every(3)": positions_df.gather_every(3)["i"].to_list(),        # every 3rd row
+}
+```
+
+`slice()` clips silently, but `gather()` (≈ `slice()` with a vector of
+positions) is strict. dplyr silently ignores positions past the end;
+`gather()` raises, and `null_on_oob=True` returns a row of nulls instead:
+
+```{python}
+#| error: true
+positions_df.gather([1, 10])
+```
+
+Square brackets do the same jobs: `df[2:5]` is `slice(2, 3)`, `df[[0, 3]]` is
+`gather([0, 3])`. The methods chain, and they also work on a `LazyFrame`.
+
+### Rows by value: `top_k()` and `bottom_k()` {#sec-verb-topk}
+
+`top_k(k, by=)` returns the *k* rows with the largest `by` values;
+`bottom_k()` the smallest. Several keys are compared like a multi-key sort,
+and `reverse=` (one bool, or one per key) flips a key's direction. The
+longest flights, ties broken by the largest departure delay:
+
+```{python}
+flights_df.top_k(3, by=["distance", "dep_delay"]).select(
+    "origin", "dest", "distance", "dep_delay"
+)
+```
+
+(The most delayed flight of 2013 was the 1,301-minute departure to Honolulu.)
+Unlike `sort()`, both verbs rank nulls below every value, so `top_k(3)` and
+`sort(descending=True).head(3)` disagree on a column with nulls. Two more
+differences from `slice_max()`: exactly *k* rows come back, and the docstring
+promises no output order (@sec-verb-ties).
+
+### Random rows: `sample()` {#sec-verb-sample}
+
+`sample()` takes `n` or `fraction` (which rounds down: 0.02 × 344 rows gives
+6), `with_replacement=False`, `seed=` (without one, every render draws a
+different sample) and `shuffle=`. The last one is the surprise. Its default,
+`None`, promises no order, and in practice a sample of every row comes back in
+input order. `slice_sample(prop = 1)` shuffles; here you need `shuffle=True`:
+
+```{python}
+penguins_df_indexed = penguins_df.with_row_index("row")
+{
+    "fraction=1": penguins_df_indexed.sample(fraction=1, seed=42)["row"].head(5).to_list(),
+    "fraction=1, shuffle=True": penguins_df_indexed.sample(
+        fraction=1, shuffle=True, seed=42
+    )["row"].head(5).to_list(),
+}
+```
+
+dplyr's `slice_sample(n = 400)` on 344 rows silently returns 344. Polars
+raises unless `with_replacement=True`:
+
+```{python}
+#| error: true
+penguins_df.sample(400, seed=1)
+```
+
+`sample()` is eager-only: `LazyFrame` has no `sample()` method.
+
+### Per-group slices {#sec-verb-groups}
+
+`group_by(g, maintain_order=True).head(n)` and `.tail(n)` are
+`slice_head()` / `slice_tail()` with `by =`. Every other per-group slice is a
+window predicate in `filter()`, which keeps rows in input order. This is
+`slice_max(body_mass_g, n = 2, by = species, with_ties = FALSE)`:
+
+```{python}
+penguins_df.filter(
+    pl.col("body_mass_g").rank("ordinal", descending=True).over("species") <= 2
+).select("species", "island", "body_mass_g")
+```
+
+`"ordinal"` breaks ties by position; `"min"` keeps them. A random 2 per group
+shuffles a row counter: `pl.int_range(pl.len()).shuffle(seed=1).over("species") < 2`.
+More in [Window Functions](window.qmd) and
+[Grouping & Aggregation](group-agg.qmd).
+
+### Select, drop, rename {#sec-verb-select}
+
+The cheatsheet maps most of tidyselect
+([Select Columns](../overview/polars-cheatsheet.qmd#sec-cs-select)). The
+column range `year:day` has no verb; on a `DataFrame` a label slice with
+square brackets does it, inclusive at both ends:
+
+```{python}
+year_to_day = flights_df[:, "year":"day"].columns
+year_to_day, flights_df.drop(year_to_day).columns[:3]   # year:day and !year:day
+```
+
+On a `LazyFrame`, select by position instead: `cs.by_index(range(0, 3))`.
+
+**`drop()` is strict.** A name that doesn't exist raises, which catches
+typos. `strict=False` ignores missing names (≈ `select(-any_of(...))`), and a
+selector that matches nothing never raises:
+
+```{python}
+#| error: true
+flights_df.drop("tail_num")
+```
+
+**`rename()` takes `{old: new}`**, the reverse of dplyr's `new = old`, or a
+function `str → str` applied to every name. Renamed columns keep their
+position, and all renames happen at once, so a swap works:
+
+```{python}
+flights_df.select("origin", "dest").head(2).rename({"origin": "dest", "dest": "origin"})
+```
+
+An old name that doesn't exist raises unless `strict=False`. A new name that
+already exists (and isn't being renamed away) raises a `DuplicateError`. To
+rename only some columns with a function (≈ `rename_with(.cols = )`), see
+[Selectors](../core/selectors.qmd#sec-sel-recipes).
+
+### Reorder columns {#sec-verb-relocate}
+
+There is no `relocate()`. Moving columns to the front or back is a `select()`
+of the moved columns plus everything else. With selectors, "everything else"
+is the complement `~` ([Set algebra](../core/selectors.qmd#sec-sel-algebra)):
+
+```{python}
+flights_df.select(cs.starts_with("arr"), ~cs.starts_with("arr")).columns[:4]
+```
+
+To **create** a column at the front (≈ `mutate(.before = 1)`), pass the new
+expression before `pl.all()`. There is no name clash, because the name is new:
+
+```{python}
+flights_df.select(
+    (pl.col("dep_delay") - pl.col("arr_delay")).alias("gain"), pl.all()
+).columns[:4]
+```
+
+`.before =` / `.after =` another column needs the name list built in Python
+(@sec-verb-recipes).
+
+### Add, replace and index columns {#sec-verb-mutate}
+
+`with_columns()` places each output by name. An existing name is replaced
+**in its position**; a new name is appended at the end, in argument order
+(keyword arguments come last, see
+[Naming](../core/expressions.qmd#sec-expr-naming)):
+
+```{python}
+flights_df.select("year", "month", "day", "air_time").head(2).with_columns(
+    hours=pl.col("air_time") / 60,          # new name → appended
+    month=pl.col("month").cast(pl.Int8),    # existing name → replaced in place
+)
+```
+
+dplyr's `.keep =` argument has no Polars equivalent, but an expression knows
+its inputs (`meta.root_names()`), which is enough to rebuild
+`mutate(gain = dep_delay - arr_delay, .keep = "used")`:
+
+```{python}
+gain = pl.col("dep_delay") - pl.col("arr_delay")
+flights_df.select(*gain.meta.root_names(), gain=gain).head(3)
+```
+
+`.keep = "none"` is plain `select()`; `.keep = "unused"` is
+`with_columns(gain=gain).drop(gain.meta.root_names())`. And
+`with_columns_seq()` is not dplyr's sequential `mutate()`: it runs expressions
+one after another instead of in parallel, but a later one still can't see an
+earlier one's output.
+
+`with_row_index()` (≈ `rowid_to_column()`) adds the index as the **first**
+column, named `index` by default, with dtype `UInt32` (unsigned, see
+[Counts are unsigned](../core/data-model.qmd#sec-dm-unsigned)). `offset=`
+sets the starting number and must not be negative:
+
+```{python}
+penguins_df.with_row_index("id", offset=1).select("id", "species").head(2)
+```
+
+## Where it bites {#sec-verb-gotchas}
+
+| tidyverse behaviour | Polars behaviour |
+|---|---|
+| `arrange()` puts `NA` last | `sort()` puts nulls first, even with `descending=True`; pass `nulls_last=True` |
+| `arrange()` keeps tied rows in input order | multi-key `sort()` does not; pass `maintain_order=True` |
+| `slice_max()` keeps ties | `top_k()` returns *k* arbitrary rows among ties |
+| `distinct()` keeps the first copy, in input order | `unique()` keeps any copy, in an order that changes every call |
+| `distinct(x)` drops the other columns | `unique(subset="x")` keeps them |
+| `slice(-1)` drops the first row | `slice(-1)` is the last row |
+| `slice()` ignores positions past the end | `gather()` raises; `null_on_oob=True` gives a null row |
+| `slice_sample(n = 400)` on 344 rows returns 344 | `sample(400)` raises; pass `with_replacement=True` |
+| `slice_sample(prop = 1)` shuffles | `sample(fraction=1)` keeps input order unless `shuffle=True` |
+| `filter(month = 1)` is an error | `filter(month=1)` means `pl.col("month") == 1` |
+| `select(x, everything())` moves `x` first | duplicate output names raise |
+| `slice_head(n = 1, by = g)` keeps column order | `group_by("g").head(1)` moves `g` to the front |
+| `names(df) <- ...` modifies a copy | `df.columns = ...` and `insert_column()` modify in place |
+
+: The differences at a glance {.striped}
+
+### Nulls sort first, even descending {#sec-verb-nulls-first}
+
+R4DS's `arrange(desc(dep_delay))` shows the most delayed flights. The same
+call in Polars shows cancelled ones:
+
+```{python}
+flights_df.sort("dep_delay", descending=True).select(
+    "month", "day", "carrier", "flight", "dep_delay"
+).head(3)
+```
+
+With `nulls_last=True`, the first row is the 1,301-minute Honolulu flight from
+@sec-verb-topk. **Rule:** pass `nulls_last=True` to every `sort()` that feeds
+`head()`, a "first per group", or a report.
+
+### Ties: unstable sorts, arbitrary `top_k()` {#sec-verb-ties}
+
+Number the rows, sort by day, and see where the file's first rows end up:
+
+```{python}
+flights_df_indexed = flights_df.with_row_index("row")
+by_day_default = flights_df_indexed.sort("month", "day")
+by_day_stable = flights_df_indexed.sort("month", "day", maintain_order=True)
+{
+    "default: first rows": by_day_default["row"].head(5).to_list(),
+    "maintain_order: first rows": by_day_stable["row"].head(5).to_list(),
+    "rows in a different position": (by_day_default["row"] != by_day_stable["row"]).sum(),
+}
+```
+
+Every row is in the right day either way, but the default sort reorders rows
+within a day: two thirds of all rows land somewhere other than where a stable
+sort puts them. The reordering was the same in every run here, and single-key
+sorts happened to be stable, but only `maintain_order=True` guarantees either.
+It matters as soon as the next step takes "the first row" of each day.
+
+`top_k()` has the same blind spot. 342 flights tie for the longest distance
+(JFK → HNL); `slice_max(distance, n = 3)` returns all of them. `top_k()`
+returns 3, and not the first 3 in the file:
+
+```{python}
+flights_df_indexed.top_k(3, by="distance").select("row", "origin", "dest", "distance")
+```
+
+Keep the ties with a rank filter, or make the choice deterministic with a
+tie-breaker key (`reverse=` per key: largest distance, then smallest row
+number):
+
+```{python}
+{
+    "ties kept (slice_max)": flights_df.filter(
+        pl.col("distance").rank("min", descending=True) <= 3
+    ).height,
+    "first 3 in file order": flights_df_indexed.top_k(
+        3, by=["distance", "row"], reverse=[False, True]
+    )["row"].to_list(),
+}
+```
+
+### `unique()` defaults: any copy, any order {#sec-verb-unique-defaults}
+
+Without `maintain_order=True`, the row order of `unique()` is not just
+arbitrary, it changes from call to call:
+
+```{python}
+carrier_orders = {tuple(flights_df.unique(subset="carrier")["carrier"]) for _ in range(20)}
+len(carrier_orders)   # distinct orderings in 20 identical calls
+```
+
+That breaks frozen renders, tests and diffs. The default `keep="any"` is the
+same kind of licence: in every probe on 2.0 it returned the first copy, but
+the docstring guarantees nothing. When the surviving row matters, spell out
+both: `unique(subset=..., keep="first", maintain_order=True)`. Per the
+docstring, `maintain_order=True` also keeps that step off the streaming
+engine.
+
+### Selections don't deduplicate {#sec-verb-select-dupes}
+
+tidyselect combines selections as a **set**: `select(time_hour, everything())`
+names `time_hour` twice and keeps it once, which is the classic way to move a
+column to the front. A Polars `select()` is a **list** of expressions, and two
+outputs with the same name are an error:
+
+```{python}
+#| error: true
+flights_df.select("time_hour", pl.all())
+```
+
+Exclude it from the rest instead: `select("time_hour", pl.exclude("time_hour"))`.
+Selector algebra does deduplicate, but a selector returns columns in **schema
+order**, so `select(cs.by_name("time_hour") | cs.all())` leaves `time_hour`
+last, where it was.
+
+### Some column verbs work in place {#sec-verb-in-place}
+
+Almost every Polars method returns a new frame. Assigning to `df.columns` and
+calling `insert_column()` modify the frame itself instead, so every Python name
+bound to that frame sees the change:
+
+```{python}
+dates_df = flights_df.select("year", "month", "day").head(2)
+same_df = dates_df                        # a second name, not a copy
+dates_df.columns = ["yr", "mo", "dy"]     # in place
+returned_df = dates_df.insert_column(0, pl.Series("id", [1, 2]))  # in place, too
+same_df.columns, returned_df is dates_df
+```
+
+R's `names(df) <- ...` is copy-on-modify: another variable bound to the old
+frame keeps the old names. `replace_column()` and `drop_in_place()` also work
+in place. `rename()`, `with_columns()` and `select()` never do.
+
+## Recipes {#sec-verb-recipes}
+
+**Rows with the max per group, ties kept** (R4DS:
+`group_by(dest) |> slice_max(arr_delay, n = 1)`). Compare each row with its
+group's max:
+
+```{python}
+worst_arrival_df = flights_df.filter(
+    pl.col("arr_delay") == pl.col("arr_delay").max().over("dest")
+)
+worst_arrival_df.height, worst_arrival_df["dest"].n_unique()
+```
+
+R4DS gets 108 rows for 105 destinations. The extra one is the single flight to
+LGA, whose `arr_delay` is `NA`: with `na_rm = FALSE`, `slice_max()` returns
+`NA` rows when a group has nothing else. In Polars that group's max is null,
+the comparison is null, and `filter()` drops the row.
+
+**First and last flight of each day.** `datasets.flights()` is not in date
+order (the months run 1, 10, 11, 12, 2, …), so "first" needs an explicit sort.
+Drop cancelled flights, sort with `maintain_order=True` so equal departure
+times keep file order, then keep the first copy per day:
+
+```{python}
+flights_df_departed = flights_df.drop_nulls("dep_time").sort(
+    "month", "day", "dep_time", maintain_order=True
+)
+flights_df_departed.unique(
+    subset=["month", "day"], keep="first", maintain_order=True
+).select("month", "day", "dep_time", "carrier", "flight", "dest").head(3)
+```
+
+`keep="last"` gives the last flight of each day.
+`group_by("month", "day", maintain_order=True).head(1)` returns the same rows,
+but moves `month` and `day` in front of `year`.
+
+**Deduplicate, keeping the latest record**: the last flight of each plane.
+Sort by time, then keep the last copy per key. Drop null keys first, because
+all nulls count as one key:
+
+```{python}
+flights_df.drop_nulls("tailnum").sort("time_hour", maintain_order=True).unique(
+    subset="tailnum", keep="last", maintain_order=True
+).select("tailnum", "time_hour", "origin", "dest").head(3)
+```
+
+`maintain_order=True` orders the result by each plane's last flight, so the
+top rows are planes last seen leaving New York in the first days of January.
+
+**Move columns before or after another** (≈ `relocate(.before =, .after =)`).
+Build the name list in Python; `cs.expand_selector()` turns a selector into
+names, so tidyselect-style arguments work too:
+
+```{python}
+def relocate(df, columns, *, before=None, after=None):
+    """Move `columns` (names or a selector) before/after an anchor column."""
+    if cs.is_selector(columns):
+        columns = cs.expand_selector(df, columns)
+    columns = [columns] if isinstance(columns, str) else list(columns)
+    rest = [c for c in df.columns if c not in columns]
+    if before is not None:
+        at = rest.index(before)
+    elif after is not None:
+        at = rest.index(after) + 1
+    else:
+        at = 0
+    return df.select(rest[:at] + columns + rest[at:])
+
+relocate(flights_df, cs.starts_with("arr"), before="dep_time").columns[:7]
+```
+
+## See also {#sec-verb-see-also}
+
+- Cheatsheet:
+  [Select Columns](../overview/polars-cheatsheet.qmd#sec-cs-select) ·
+  [Filter Rows](../overview/polars-cheatsheet.qmd#sec-cs-filter) ·
+  [Sort Rows](../overview/polars-cheatsheet.qmd#sec-cs-sort) ·
+  [Gotchas at a Glance](../overview/polars-cheatsheet.qmd#sec-cs-gotchas)
+- Before: [Expressions & Contexts](../core/expressions.qmd) (contexts, and
+  why expression-level `sort()` misaligns rows) ·
+  [Selectors & Expression Expansion](../core/selectors.qmd)
+- Next: [Grouping & Aggregation](group-agg.qmd) ·
+  [Window Functions](window.qmd) · [Missing Values](../types/missing.qmd)
+- Polars API:
+  [`DataFrame.unique`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.unique.html) ·
+  [`DataFrame.sort`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.sort.html) ·
+  [`DataFrame.top_k`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.top_k.html)
+- R side: R4DS 2e, [Data transformation](https://r4ds.hadley.nz/data-transform.html);
+  `?dplyr::slice_max` (`with_ties`, `na_rm`), `?dplyr::arrange` (`.locale`)

@@ -1,0 +1,648 @@
+---
+title: "Joins & Concatenation"
+subtitle: "≈ two-table verbs · `join_by()` · `bind_rows()` / `bind_cols()`"
+jupyter: python3
+---
+
+dplyr has a verb per join type; Polars has one method, `join()`, with `how=`
+choosing the type, plus `join_where()` for inequality joins and
+`join_asof()` for closest-match joins. Binding rows and columns is one
+function, `pl.concat(how=...)`. The one-line translations are in the
+[cheatsheet](../overview/polars-cheatsheet.qmd#sec-cs-joins). This chapter
+covers the defaults behind them. Several differ from dplyr: the join type,
+null keys, which key columns survive, row order, and dtype checks.
+
+## In tidyverse {#sec-join-tidyverse}
+
+```r
+library(dplyr)
+library(nycflights13)
+
+planes |> count(tailnum) |> filter(n > 1)              # is tailnum a primary key?
+flights2 <- flights |> select(year, time_hour, origin, dest, tailnum, carrier)
+flights2 |> left_join(airlines)                         # natural join: by = "carrier"
+flights2 |> left_join(planes, join_by(tailnum))         # year.x, year.y
+flights2 |> left_join(airports, join_by(dest == faa))
+flights2 |> left_join(weather, join_by(origin, time_hour), relationship = "many-to-one")
+flights2 |> anti_join(planes, join_by(tailnum)) |> distinct(tailnum)
+employees |> inner_join(parties, join_by(between(birthday, start, end)))
+employees |> left_join(parties, join_by(closest(birthday >= party)))
+bind_rows(list(a = df1, b = df2), .id = "source")
+```
+
+Without being asked, dplyr joins on every shared column when `by` is missing,
+keeps the row order of `x`, matches `NA` to `NA`, warns about many-to-many
+matches, suffixes clashing columns on both sides (`.x`, `.y`), and merges the
+two key columns in `full_join()`. Polars does none of these by default. Each
+one is a parameter of `join()`.
+
+## Mental model {#sec-join-model}
+
+```text
+ x.join(y, on="k", how=...)                 x = left frame, y = right frame
+
+   x                  y
+   k   x-cols         k   y-cols            a match = equal keys
+   ──────────         ──────────            null ≠ null (unless nulls_equal=True)
+   1   x1  ──────────► 1   y1
+   2   x2  ──────┬───► 2   y2a              a key repeated in y repeats its x row
+                 └───► 2   y2b              (m:m; checked only with validate=)
+   3   x3              4   y4
+
+   how="inner"  matched rows only                             ← the DEFAULT
+   how="left"   every x row; y-cols null when unmatched
+   how="right"  every y row; x-cols null when unmatched
+   how="full"   every row of both; k and k_right unless coalesce=True
+   how="semi"   x rows with a match      ┐ filtering joins: x-cols only,
+   how="anti"   x rows without a match   ┘ never duplicate a row
+   how="cross"  every x row × every y row, no key
+```
+
+The other two join methods change only the match rule. `join_where()`
+replaces "equal keys" with any Boolean predicate, and `join_asof()` replaces
+it with "the closest key", giving at most one match per left row.
+
+## Mechanics {#sec-join-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import datetime as dt
+
+import polars as pl
+from pl_notes import datasets
+
+flights_df = datasets.flights()
+airlines_df = datasets.airlines()
+airports_df = datasets.airports()
+planes_df = datasets.planes()
+weather_df = datasets.weather()
+```
+
+### Keys {#sec-join-keys}
+
+A primary key must be unique and never null. Check both before you rely on it:
+
+```{python}
+planes_df.select(
+    n=pl.len(), n_unique=pl.col("tailnum").n_unique(), n_null=pl.col("tailnum").null_count()
+)
+```
+
+For a compound key, wrap the columns in a struct so that the duplicate check
+looks at the combination (≈ `count(time_hour, origin) |> filter(n > 1)`):
+
+```{python}
+weather_df.filter(pl.struct("origin", "time_hour").is_duplicated()).height
+```
+
+`weather` also has the clock parts `year, month, day, hour`. They look like an
+equivalent key, but they are not:
+
+```{python}
+weather_df.group_by("origin", "year", "month", "day", "hour").len().filter(
+    pl.col("len") > 1
+).sort("origin")
+```
+
+On 2013-11-03 New York set its clocks back, so 01:00 happened twice. The
+time-zone-aware `time_hour` keeps the two hours apart (`01:00 EDT`, then
+`01:00 EST`); the clock parts can't. Use the instant as the key (see
+[Dates, Times & Durations](../types/datetime.qmd)).
+
+`flights` is keyed by `(time_hour, carrier, flight)`, which has no duplicates.
+Where no natural key exists, `with_row_index("id")` adds a surrogate key
+(≈ `mutate(id = row_number())`, but 0-based and `UInt32`). Note that
+`is_duplicated()` flags **every** copy, where R's `duplicated()` flags only the
+later ones.
+
+### Mutating joins {#sec-join-mutating}
+
+Start from R4DS's narrow `flights2`:
+
+```{python}
+flights2_df = flights_df.select("year", "time_hour", "origin", "dest", "tailnum", "carrier")
+
+flights2_df.join(airlines_df, on="carrier", how="left", maintain_order="left").head(3)
+```
+
+`maintain_order="left"` keeps the row order of `flights2_df`
+(@sec-join-order). Polars has no natural join, so `on` is required:
+
+```{python}
+#| error: true
+flights2_df.join(airlines_df, how="left")
+```
+
+**Clashing columns.** `flights2` and `planes` both have `year` (the year of
+the flight vs the year the plane was built). Polars renames only the **right**
+copy, using `suffix=` (default `"_right"`). dplyr would give `year.x` and
+`year.y`. To rename the left copy too, rename it before the join:
+
+```{python}
+flights2_df.join(
+    planes_df.select("tailnum", "year", "type"), on="tailnum", how="left",
+    suffix="_built", maintain_order="left",
+).head(3)
+```
+
+**Different key names.** `left_on="dest", right_on="faa"` ≈
+`join_by(dest == faa)`. The output keeps `dest` and drops `faa`.
+`coalesce=False` keeps both (≈ `keep = TRUE`).
+
+**Compound keys.** Pass a list. `time_hour` is `Datetime("us",
+"America/New_York")` in both tables, and it has to be: the unit and the zone
+must match (@sec-join-dtypes):
+
+```{python}
+flights_weather_df = flights2_df.join(
+    weather_df.select("origin", "time_hour", "temp", "wind_speed"),
+    on=["origin", "time_hour"], how="left", maintain_order="left",
+)
+flights_weather_df.head(3)
+```
+
+### `how=` and `coalesce=` {#sec-join-how}
+
+R4DS's toy tables show every join type. Each entry is the result's
+`(rows, columns)`:
+
+```{python}
+x_df = pl.DataFrame({"k": [1, 2, 3], "x": ["x1", "x2", "x3"]})
+y_df = pl.DataFrame({"k": [1, 2, 4], "y": ["y1", "y2", "y4"]})
+
+hows = ["inner", "left", "right", "full", "semi", "anti"]
+joined = {how: x_df.join(y_df, on="k", how=how) for how in hows}
+{how: (res.height, res.columns) for how, res in joined.items()}
+```
+
+If you leave out `how=`, you get `inner`, and unmatched rows disappear with no
+message. `right` moves `k` into the right frame's position (`x, k, y`).
+`full` returns **two** key columns, and `k` is null for the row that only
+exists in `y`:
+
+```{python}
+x_df.join(y_df, on="k", how="full", maintain_order="left_right")
+```
+
+```{python}
+x_df.join(y_df, on="k", how="full", coalesce=True, maintain_order="left_right")
+```
+
+| `how` | `coalesce=None` (default) | Key columns in the output |
+|---|---|---|
+| `inner`, `left` | coalesce | one, with the left name (`dest`) |
+| `right` | coalesce | one, with the **right** name (`faa`); dplyr keeps `dest` |
+| `full` | **don't** coalesce | `k` + `k_right` (or `dest` + `faa`) |
+| `semi`, `anti` | — | left columns only |
+| any, with an expression key | **never** coalesce | every key twice (@sec-join-expr-keys) |
+
+: Which key columns survive {.striped}
+
+`how="cross"` takes no key: passing `on=` raises `ValueError`.
+
+### Duplicate keys and `validate=` {#sec-join-validate}
+
+A key that repeats on both sides multiplies rows. If you forget `time_hour`
+when joining weather, three flights turn into 26,115 rows, one for every hour
+recorded at their airports:
+
+```{python}
+flights_df.head(3).join(weather_df, on="origin").height
+```
+
+dplyr warns about an unexpected many-to-many relationship. Polars says
+nothing, because the default is `validate="m:m"`, which checks nothing. State
+the relationship you expect:
+
+```{python}
+#| error: true
+flights_df.head(3).join(weather_df, on="origin", validate="m:1")
+```
+
+`"m:1"` requires unique keys on the right, `"1:m"` on the left, and `"1:1"`
+on both. The docstring says the streaming engine doesn't support `validate`,
+but in 2.0.0 a lazy `validate="1:1"` join of `flights` to `planes` still
+raised under the default `collect()`. dplyr's `unmatched = "error"` has no
+parameter equivalent; check with an anti join (@sec-join-filtering).
+
+### Nulls and NaN in keys {#sec-join-nulls}
+
+```{python}
+x_null_df = pl.DataFrame({"k": [1, None, 3], "x": ["x1", "x_null", "x3"]})
+y_null_df = pl.DataFrame({"k": [1, None, None], "y": ["y1", "y_null_a", "y_null_b"]})
+
+x_null_df.join(y_null_df, on="k", how="left", maintain_order="left")
+```
+
+The null key matched nothing. dplyr's default (`na_matches = "na"`) would
+have matched it twice. Pass `nulls_equal=True` to get that behaviour:
+
+```{python}
+x_null_df.join(y_null_df, on="k", how="left", nulls_equal=True, maintain_order="left_right")
+```
+
+`NaN` is different: it **does** match `NaN`, with no flag:
+
+```{python}
+nan_df = pl.DataFrame({"k": [1.0, float("nan")], "v": [1, 2]})
+nan_df.join(nan_df, on="k", maintain_order="left")
+```
+
+So the 2,512 flights with a null `tailnum` can never match a plane. More on
+null semantics in [Missing Values](../types/missing.qmd).
+
+### Key dtypes {#sec-join-dtypes}
+
+Integer keys of different widths join without complaint. Any other mismatch
+is a `SchemaError`, including different time zones:
+
+```{python}
+#| error: true
+flights2_df.join(
+    weather_df.with_columns(pl.col("time_hour").dt.convert_time_zone("UTC")),
+    on=["origin", "time_hour"],
+)
+```
+
+| Left key | Right key | Result |
+|---|---|---|
+| `Int64` | `Int32`, `UInt32` | joins; a left join keeps the left dtype |
+| `Int64` | `Float64` or `String` | `SchemaError` |
+| `String` | `Categorical` | `SchemaError` |
+| `Datetime("us", "America/New_York")` | `Datetime("us", "UTC")`, `Datetime("us")`, `Datetime("ms", …)` | `SchemaError` |
+
+: Key dtype pairs (verified on Polars 2.0.0) {.striped}
+
+In R, a POSIXct's `tzone` attribute only changes how it is displayed. In
+Polars, the zone is part of the dtype (see [Data Model](../core/data-model.qmd)),
+so align keys with `cast()` or `dt.convert_time_zone()` before you join.
+
+### Row order: `maintain_order=` {#sec-join-order}
+
+The default, `maintain_order="none"`, promises no order. The docstring warns
+that it "might differ across Polars versions or even between different
+runs". Eager left joins often happen to keep the left order, which makes the
+default easy to trust by accident. An eager inner join doesn't:
+
+```{python}
+{
+    order: airlines_df.join(flights2_df, on="carrier", maintain_order=order)["carrier"]
+    .head(4).to_list()
+    for order in ["none", "left_right"]
+}
+```
+
+`airlines` starts with `9E`, but the default result follows `flights`. Lazy
+queries run on the streaming engine by default in 2.0, and there even a left
+join loses the left order:
+
+```{python}
+def left_join_lazily(**kwargs) -> pl.DataFrame:
+    return (
+        flights_df.with_row_index("row").lazy()
+        .join(airlines_df.lazy(), on="carrier", how="left", **kwargs)
+        .collect()
+    )
+
+{order: left_join_lazily(maintain_order=order)["row"].is_sorted() for order in ["none", "left"]}
+```
+
+The other options are `"right"`, and `"left_right"` / `"right_left"` (order by
+the first frame, then by the second). `"left"` matches dplyr. Keeping an order
+costs speed, so skip it if you `.sort()` the result anyway.
+
+### Filtering joins {#sec-join-filtering}
+
+`semi` and `anti` keep only the left columns, and they return each left row
+at most once, however many matches it has. Of the 1,458 airports, 3 are
+origins and 101 are destinations:
+
+```{python}
+{
+    key: airports_df.join(flights_df, left_on="faa", right_on=key, how="semi").height
+    for key in ["origin", "dest"]
+}
+```
+
+An anti join finds **implicit missing** keys: values a foreign key points to
+that are absent from the target table. These four destinations aren't in
+`airports`, so a left join leaves their airport names null:
+
+```{python}
+flights_df.join(airports_df, left_on="dest", right_on="faa", how="anti").select(
+    pl.col("dest").unique().sort()
+)
+```
+
+### Non-equi joins: `join_where()` {#sec-join-where}
+
+R4DS's party example: there is one party per quarter, and each employee goes
+to the party for the quarter that contains their birthday:
+
+```{python}
+def dates(*isos: str) -> pl.Series:
+    return pl.Series(isos).str.to_date()
+
+parties_df = pl.DataFrame({
+    "q": [1, 2, 3, 4],
+    "party": dates("2022-01-10", "2022-04-04", "2022-07-11", "2022-10-03"),
+    "start": dates("2022-01-01", "2022-04-04", "2022-07-11", "2022-10-03"),
+    "end": dates("2022-04-03", "2022-07-11", "2022-10-02", "2022-12-31"),
+})
+employees_df = pl.DataFrame({
+    "name": ["Ana", "Bo", "Cy", "Di", "Ed"],
+    "birthday": dates("2022-01-05", "2022-02-14", "2022-07-11", "2022-09-30", "2022-12-25"),
+})
+
+employees_df.join_where(
+    parties_df, pl.col("birthday").is_between(pl.col("start"), pl.col("end"))
+).sort("name", "q")
+```
+
+Cy matches two quarters because of a data-entry bug: Q2 ends on the day Q3
+starts. `join_where()` takes any number of predicates and combines them with
+AND. A name that exists in only one frame refers to that frame. A name that
+exists in both refers to the **left** column; write the right one with its
+suffix. `pl.col("q") < pl.col("q")` raises no error: it compares the left `q`
+with itself and returns no rows. A self-join on `overlaps` finds the bug:
+
+```{python}
+parties_df.join_where(
+    parties_df,
+    pl.col("start") <= pl.col("end_right"),   # overlaps(start, end, start, end)
+    pl.col("end") >= pl.col("start_right"),
+    pl.col("q") < pl.col("q_right"),          # each pair once, no self-pairs
+).select("q", "start", "end", "q_right", "start_right", "end_right")
+```
+
+| dplyr `join_by()` helper | `join_where()` predicate(s) |
+|---|---|
+| `x > y`, `x <= y`, … | `pl.col("x") > pl.col("y")` |
+| `between(x, lo, hi)` | `pl.col("x").is_between(pl.col("lo"), pl.col("hi"))`, both ends inclusive |
+| `within(x_lo, x_hi, y_lo, y_hi)` | `pl.col("x_lo") >= pl.col("y_lo"), pl.col("x_hi") <= pl.col("y_hi")` |
+| `overlaps(x_lo, x_hi, y_lo, y_hi)` | `pl.col("x_lo") <= pl.col("y_hi"), pl.col("x_hi") >= pl.col("y_lo")` |
+| `cross_join()` + `filter()` | any Boolean expression, including `|` and arithmetic |
+
+: Inequality helpers {.striped}
+
+`join_where()` is marked experimental. It accepts `how="inner"` (default),
+`"left"`, or `"right"`. Its docstring says row order is not preserved, so sort
+the result.
+
+### Rolling joins: `join_asof()` {#sec-join-asof}
+
+`join_asof()` works like a left join, except that each left row takes the one
+right row whose key is **closest**. With the default `strategy="backward"`,
+that is the last right key `<=` the left key, the same as R4DS's
+`closest(birthday >= party)` (the latest party on or before each birthday):
+
+```{python}
+employees_df.join_asof(
+    parties_df.select("q", "party"), left_on="birthday", right_on="party"
+)
+```
+
+No party comes on or before Ana's birthday, so she gets null. Unlike `join()`,
+`join_asof()` keeps the right key column (`party`).
+
+| dplyr | `join_asof()` |
+|---|---|
+| `closest(x >= y)` | `strategy="backward"` (default) |
+| `closest(x > y)` | `strategy="backward", allow_exact_matches=False` |
+| `closest(x <= y)` | `strategy="forward"` |
+| — | `strategy="nearest"` (either direction) |
+| equality on other columns first | `by="g"` (or `by_left` / `by_right`) |
+| — | `tolerance="30d"`: no match beyond this distance |
+
+: `closest()` and its options {.striped}
+
+**Both frames must be sorted by the key.** Without `by`, Polars checks this
+and raises an error:
+
+```{python}
+#| error: true
+employees_df.sort("birthday", descending=True).join_asof(
+    parties_df, left_on="birthday", right_on="party"
+)
+```
+
+With `by`, each group must be sorted, and Polars **cannot check** that. It
+emits a `UserWarning` on every call, even when the data is sorted, and
+unsorted data silently gives wrong matches:
+
+```{python}
+trades_df = pl.DataFrame({"sym": ["A", "B", "A", "B"], "t": [1, 5, 7, 9]})
+quotes_df = pl.DataFrame({"sym": ["A", "A", "B", "B"], "t": [6, 0, 8, 2], "px": [11, 10, 21, 20]})
+
+trades_df.join_asof(quotes_df, on="t", by="sym")   # quotes not sorted by t
+```
+
+All four matches are wrong. Sort the data yourself, then pass
+`check_sortedness=False`, which also silences the warning:
+
+```{python}
+trades_df.join_asof(quotes_df.sort("t"), on="t", by="sym", check_sortedness=False)
+```
+
+### Concatenation {#sec-join-concat}
+
+| `pl.concat(how=)` | Columns matched by | Dtype mismatch | ≈ dplyr |
+|---|---|---|---|
+| `"vertical"` (default) | position; names must be identical | error | `bind_rows()` of identical frames |
+| `"vertical_relaxed"` | position; names must be identical | cast to supertype | — |
+| `"diagonal"` | name; missing → null | error | `bind_rows()` |
+| `"diagonal_relaxed"` | name; missing → null | cast to supertype | `bind_rows()` (closest) |
+| `"horizontal"` | — (equal heights required) | — | `bind_cols()` |
+| `"horizontal_extend"` | — (shorter frames padded with null) | — | — |
+| `"align"` (= `"align_full"`), `"align_inner"`, `"align_left"`, `"align_right"` | shared columns, used as a sorted key | — | `reduce(dfs, full_join)` |
+
+: Concatenation strategies in 2.0 {.striped}
+
+`bind_rows()` matches columns by **name**. The default `"vertical"` requires
+the same names in the same order:
+
+```{python}
+#| error: true
+ewr_df = airports_df.filter(pl.col("faa") == "EWR").select("faa", "name")
+jfk_df = airports_df.filter(pl.col("faa") == "JFK").select("name", "faa")
+pl.concat([ewr_df, jfk_df])
+```
+
+```{python}
+pl.concat([ewr_df, jfk_df], how="diagonal")
+```
+
+The `_relaxed` variants cast to the supertype, and the supertype of `Int64`
+and `String` is `String`. Numbers become text where `bind_rows()` would raise
+an error. In 2.0, `"horizontal"` requires equal heights (its `strict=`
+parameter is deprecated as redundant). To pad shorter frames with nulls, use
+`"horizontal_extend"`:
+
+```{python}
+#| error: true
+pl.concat([x_df, pl.DataFrame({"z": [True]})], how="horizontal")
+```
+
+`pl.union()` is **not** dplyr's `union()`. It is `pl.concat()` without a
+row-order guarantee, and it keeps duplicates (`UNION ALL`, not `UNION`).
+
+### Set operations {#sec-join-setops}
+
+dplyr's `union()`, `intersect()` and `setdiff()` compare whole rows, treat
+`NA` as equal, and drop duplicates. In Polars, build them from
+`concat` + `unique` and from semi/anti joins on every column. The joins need
+`nulls_equal=True`:
+
+```{python}
+a_df = pl.DataFrame({"x": [1, 2, None], "y": ["a", "b", "c"]})
+b_df = pl.DataFrame({"x": [2, None, 4], "y": ["b", "c", "d"]})
+every_col = {"on": a_df.columns, "nulls_equal": True}
+
+{
+    "intersect, nulls unequal": a_df.join(b_df, on=a_df.columns, how="semi").rows(),
+    "intersect": a_df.join(b_df, how="semi", **every_col).unique(maintain_order=True).rows(),
+    "setdiff": a_df.join(b_df, how="anti", **every_col).unique(maintain_order=True).rows(),
+    "union": pl.concat([a_df, b_df]).unique(maintain_order=True).rows(),
+}
+```
+
+## Where it bites {#sec-join-gotchas}
+
+| dplyr behaviour | Polars behaviour |
+|---|---|
+| the join type is in the verb's name | `join()` defaults to `how="inner"` |
+| no `by` → natural join | `on` is required |
+| `NA` matches `NA` | null never matches; `NaN` matches `NaN` |
+| `.x` and `.y` on both sides | only the right side gets a suffix (`_right`) |
+| `full_join()` merges keys | `k` + `k_right` unless `coalesce=True` |
+| output follows `x` | any order unless `maintain_order=` |
+| warns on many-to-many | silent unless `validate=` |
+| keys of compatible types combine | only integer widths are cast; other mismatches raise |
+| `bind_rows()` matches by name | `"vertical"` needs identical names in identical order |
+
+: The differences at a glance {.striped}
+
+### An expression key turns off coalescing for every key {#sec-join-expr-keys}
+
+`left_on` / `right_on` accept expressions, so you can join daily
+precipitation by the calendar date of `time_hour`. But once **any** key is an
+expression, Polars coalesces none of them, so even the plain `origin` comes
+out twice:
+
+```{python}
+weather_daily_df = weather_df.group_by("origin", date=pl.col("time_hour").dt.date()).agg(
+    precip_day=pl.col("precip").sum()
+)
+
+flights2_df.select("origin", "time_hour").join(
+    weather_daily_df, left_on=["origin", pl.col("time_hour").dt.date()],
+    right_on=["origin", "date"], how="left", maintain_order="left",
+).head(2)
+```
+
+`coalesce=True` doesn't change this, and an `.alias()` inside a key raises
+`'alias' is not allowed in a join key, use 'with_columns' first`. Taking that
+advice and building the key as a column makes every key plain:
+
+```{python}
+flights2_df.select("origin", "time_hour").with_columns(
+    date=pl.col("time_hour").dt.date()
+).join(weather_daily_df, on=["origin", "date"], how="left", maintain_order="left").head(2)
+```
+
+### A null after a left join is not the same as no match
+
+```{python}
+{
+    "temp is null": flights_weather_df["temp"].null_count(),
+    "no weather row": flights2_df.join(weather_df, on=["origin", "time_hour"], how="anti").height,
+}
+```
+
+The 17 extra nulls come from weather rows that exist but have no `temp`
+value. To count unmatched rows, use an anti join, or test a right-side column
+that is never null.
+
+## Recipes {#sec-join-recipes}
+
+**Add airline and destination names to flights.** Validate each lookup and
+keep the flight order:
+
+```{python}
+flights_df.select("time_hour", "carrier", "flight", "dest").join(
+    airlines_df.rename({"name": "airline"}),
+    on="carrier", how="left", validate="m:1", maintain_order="left",
+).join(
+    airports_df.select("faa", dest_name="name"),
+    left_on="dest", right_on="faa", how="left", validate="m:1", maintain_order="left",
+).head(3)
+```
+
+**Weather at departure, with gaps.** The exact join on `(origin, time_hour)`
+misses 1,556 flights. 932 of them are scheduled after `weather` ends
+(2013-12-30 18:00), and the rest fall in hours with no observation. A backward
+as-of join takes the latest observation within 3 hours:
+
+```{python}
+flights2_df.sort("time_hour").join_asof(
+    weather_df.select("origin", "temp", obs_time="time_hour").sort("obs_time"),
+    left_on="time_hour", right_on="obs_time",
+    by="origin", tolerance="3h", check_sortedness=False,
+).select(no_obs=pl.col("obs_time").null_count())
+```
+
+That leaves 794 flights without an observation, 790 of which are more than
+3 hours past the end of the record.
+
+**Which tail numbers are missing from `planes`?** This is R4DS's question.
+There are 722 distinct missing values, null included, since null never
+matches. Two carriers account for most of the flights:
+
+```{python}
+flights_df.join(planes_df, on="tailnum", how="anti").group_by("carrier").agg(
+    n_flights=pl.len(), n_tailnums=pl.col("tailnum").n_unique()
+).sort("n_flights", descending=True).head(3)
+```
+
+**The rate in effect on each date.** A rate table lists the date each value
+*starts*, and every date takes the latest start on or before it. Here is a
+made-up surcharge per carrier:
+
+```{python}
+surcharge_df = pl.DataFrame({
+    "carrier": ["AA", "AA", "UA", "UA", "UA"],
+    "effective": dates("2013-01-01", "2013-07-01", "2013-01-01", "2013-03-15", "2013-09-01"),
+    "surcharge": [25, 40, 30, 35, 45],
+})
+
+flights_df.filter(pl.col("carrier").is_in(["AA", "UA"])).group_by(
+    "carrier", date=pl.col("time_hour").dt.date()
+).agg(n_flights=pl.len()).sort("date").join_asof(
+    surcharge_df.sort("effective"), left_on="date", right_on="effective",
+    by="carrier", check_sortedness=False,
+).filter(
+    pl.col("date").is_between(dt.date(2013, 3, 14), dt.date(2013, 3, 15))
+).sort("carrier", "date")
+```
+
+The UA rate changes on 2013-03-15 and AA's does not.
+
+## See also {#sec-join-see-also}
+
+- Cheatsheet: [Joins & Binding](../overview/polars-cheatsheet.qmd#sec-cs-joins) ·
+  [Gotchas at a Glance](../overview/polars-cheatsheet.qmd#sec-cs-gotchas)
+- Related: [Missing Values](../types/missing.qmd) (null vs `NaN`, implicit
+  missing rows) · [Dates, Times & Durations](../types/datetime.qmd) (time
+  zones in keys) · [Reshaping](reshape.qmd) (`complete()` via a cross join) ·
+  [Lazy API](../scale/lazy.qmd) (the streaming engine and row order)
+- Polars user guide: [Joins](https://docs.pola.rs/user-guide/transformations/joins/) ·
+  [Concatenation](https://docs.pola.rs/user-guide/transformations/concatenation/)
+- Python API: [`DataFrame.join`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.join.html) ·
+  [`join_where`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.join_where.html) ·
+  [`join_asof`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.join_asof.html) ·
+  [`pl.concat`](https://docs.pola.rs/api/python/stable/reference/api/polars.concat.html)
+- R4DS 2e: [Joins](https://r4ds.hadley.nz/joins.html)

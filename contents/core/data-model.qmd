@@ -1,0 +1,485 @@
+---
+title: "Data Model & Dtypes"
+subtitle: "≈ tibble · atomic vectors · vctrs coercion"
+jupyter: python3
+---
+
+Before expressions, the data they run on. A Polars `DataFrame` is a tibble
+with a larger and stricter type system. This chapter covers the three
+containers, how a column sits in memory, the dtype catalogue mapped to R's
+types, and the coercion rules: Polars refuses to coerce in places where R
+would, and silently wraps integers in places where R would warn.
+
+## In tidyverse {#sec-dm-tidyverse}
+
+```r
+library(palmerpenguins)
+
+typeof(penguins$body_mass_g)     # "integer": a 32-bit atomic vector
+attributes(penguins$species)     # $levels, $class "factor": an integer + attributes
+unclass(as.Date("2025-01-01"))   # 20089: a Date is a number + a class
+
+c(1L, 2.5)                       # silently becomes double
+dplyr::bind_rows(tibble(a = 1L), tibble(a = 2.5))   # a becomes double
+as.integer(c("1", "x"))          # 1 NA, with a warning
+as.integer("3.7")                # 3
+.Machine$integer.max + 1L        # NA, with a warning
+```
+
+R's model: a tibble is a named list of equal-length atomic vectors. There are a
+handful of atomic types, and everything richer (factor, Date, POSIXct) is one
+of them plus attributes. Coercion is generous: base R and vctrs pick a common
+type and carry on.
+
+Polars has many more types, and it coerces only when you ask it to.
+
+## Mental model {#sec-dm-model}
+
+```text
+             df["x"] / df.get_column("x")              df.lazy()
+  Series  ◄─────────────────────────────  DataFrame  ──────────────►  LazyFrame
+          ─────────────────────────────►             ◄──────────────
+             s.to_frame()                              lf.collect()
+
+  one named, typed column     equal-length Series,      a query plan:
+  ≈ an atomic vector          unique names, no          no data until collect()
+                              row names ≈ tibble        ≈ a dbplyr lazy tbl
+
+  Inside a Series (Apache Arrow layout)
+  ┌──────────┬──────┬──────┬──────┬──────┬──────┐
+  │ values   │ 3750 │ 3800 │ 3250 │   ·  │ 3450 │  one contiguous buffer, fixed-width dtype
+  │ validity │   1  │   1  │   1  │   0  │   1  │  1 bit per row: 0 = null
+  └──────────┴──────┴──────┴──────┴──────┴──────┘
+```
+
+Two consequences:
+
+- **Null is a separate bit, not a special value.** In R, `NA_integer_` *is* a
+  value (the smallest 32-bit integer is reserved for it) and `NA_real_` is a
+  NaN with a special payload. In Polars, any dtype can be null, and null and
+  `NaN` are different things (see [Missing Values](../types/missing.qmd)).
+- **A column is the unit of work.** Selecting, adding or dropping a column
+  never touches the others, which is why returning a new frame from every verb
+  is cheap (@sec-dm-sharing).
+
+## Mechanics {#sec-dm-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import datetime as dt
+from decimal import Decimal
+
+import polars as pl
+import polars.selectors as cs
+from pl_notes import datasets
+
+penguins_df = datasets.penguins()
+flights_df = datasets.flights()
+```
+
+### Series, DataFrame, LazyFrame {#sec-dm-containers}
+
+Pulling one column out gives a `Series`, the equivalent of `penguins$body_mass_g`:
+
+```{python}
+mass = penguins_df["body_mass_g"]
+mass.head(3)
+```
+
+A `Series` is data, already computed. It supports most expression methods
+directly, and because it stands alone, `sort()` can't misalign anything:
+
+```{python}
+mass.mean(), mass.null_count(), mass.sort(descending=True, nulls_last=True).head(2).to_list()
+```
+
+Don't confuse it with the expression that names the same column:
+
+| R | Polars | What it is |
+|---|---|---|
+| `penguins$body_mass_g` | `penguins_df["body_mass_g"]` | a `Series`: data, computed now |
+| bare `body_mass_g` inside `mutate()` | `pl.col("body_mass_g")` | an `Expr`: a recipe (see [Expressions & Contexts](expressions.qmd)) |
+
+: Series vs Expr {.striped}
+
+A `Series` can go straight into a context, like `mutate(z = some_vector)`. Its
+length must match the frame's height:
+
+```{python}
+weights = pl.Series("weight", [0.5, 1.0, 2.0] * 114 + [1.0, 1.0])  # 344 values
+penguins_df.with_columns(weights).select("species", "weight").head(3)
+```
+
+A `LazyFrame` holds a plan instead of data, but it already knows the output
+schema, and computing that schema reads no data:
+
+```{python}
+penguins_df.lazy().with_columns(
+    bill_ratio=pl.col("bill_length_mm") / pl.col("bill_depth_mm")
+).collect_schema()
+```
+
+The [Lazy API](../scale/lazy.qmd) chapter covers the rest.
+
+### Columns are shared, not copied {#sec-dm-sharing}
+
+Every verb returns a new `DataFrame`. That would be expensive if each one
+copied the data, but unchanged columns are shared. To prove it, compare the
+memory address of the `year` buffer before and after:
+
+```{python}
+def buffer_address(s: pl.Series) -> int:
+    """Address of a Series' values (a NumPy view; raises if a copy is needed)."""
+    return s.to_numpy(allow_copy=False).__array_interface__["data"][0]
+
+year_address = buffer_address(penguins_df["year"])
+
+{
+    "with_columns(), year untouched": buffer_address(
+        penguins_df.with_columns(year2=pl.col("year") * 2)["year"]
+    ) == year_address,
+    "select('year')": buffer_address(penguins_df.select("year")["year"]) == year_address,
+    "year recomputed": buffer_address(
+        penguins_df.with_columns(pl.col("year") + 0)["year"]
+    ) == year_address,
+}
+```
+
+R has done the same since 3.1.0: `mutate()` makes a *shallow* copy, and
+`lobstr::ref()` shows the unchanged columns pointing at the same memory. In
+both languages, the style of never modifying in place and always returning a
+new frame costs almost nothing.
+
+### The dtype catalogue {#sec-dm-dtypes}
+
+| R | Polars dtype | Notes |
+|---|---|---|
+| `logical` | `Boolean` | bit-packed: 1 bit per value (R uses 32) |
+| `integer` | `Int32`, but the **default is `Int64`** | also `Int8`, `Int16`, `Int128`, `UInt8` … `UInt128` |
+| `double` | `Float64` | also `Float32`, `Float16` |
+| `bit64::integer64` | `Int64` | built in, no extra package |
+| — | `Decimal(precision, scale)` | exact base-10 arithmetic (@sec-dm-decimal) |
+| `character` | `String` | UTF-8; `pl.Utf8` is an old alias |
+| `raw` | `Binary` | |
+| `factor` | `Categorical`, `Enum` | `Enum` has a fixed set of levels in a fixed order |
+| `Date` | `Date` | |
+| `POSIXct` | `Datetime(time_unit, time_zone)` | microseconds by default |
+| `difftime` | `Duration(time_unit)` | |
+| `hms::hms` | `Time` | |
+| list-column | `List(inner)` | every element shares **one** inner dtype |
+| — | `Array(inner, shape)` | fixed-length list |
+| data-frame column | `Struct({name: dtype, ...})` | named fields |
+| an all-`NA` vector | `Null` | the dtype of a column with no values |
+
+: R types → Polars dtypes {.striped}
+
+What Python values become:
+
+```{python}
+pl.DataFrame({
+    "int": [1], "float": [1.5], "str": ["a"], "bool": [True], "none": [None],
+    "date": [dt.date(2025, 1, 1)], "datetime": [dt.datetime(2025, 1, 1, 9)],
+    "timedelta": [dt.timedelta(days=1)], "time": [dt.time(9, 30)],
+    "list": [[1, 2]], "dict": [{"a": 1, "b": "x"}], "decimal": [Decimal("1.10")],
+}).glimpse()
+```
+
+To test a dtype, compare it with a dtype **class** to match any parameters,
+or with an **instance** to match exactly:
+
+```{python}
+time_hour_dtype = flights_df.schema["time_hour"]
+(
+    time_hour_dtype == pl.Datetime,                       # any unit, any zone
+    time_hour_dtype == pl.Datetime("us"),                 # zone differs → False
+    time_hour_dtype == pl.Datetime("us", "America/New_York"),
+    penguins_df.schema["body_mass_g"].is_integer(),
+)
+```
+
+Choosing columns by dtype (`where(is.numeric)`) is covered in
+[Selectors](selectors.qmd).
+
+### Logical types on physical types {#sec-dm-physical}
+
+R stores a Date as a number with a class attribute. Polars does the same: a
+*logical* dtype is stored as a *physical* one, and `to_physical()` shows the
+stored values:
+
+```{python}
+flights_df.select(
+    pl.col("time_hour").head(1),
+    stored=pl.col("time_hour").head(1).to_physical(),   # µs since 1970-01-01 UTC
+)
+```
+
+The time zone is part of the dtype, not the stored data. R's POSIXct works the
+same way: seconds since the epoch plus a `tzone` attribute. `Enum` and
+`Categorical` work like factors, as small unsigned integer codes plus the
+levels:
+
+```{python}
+penguins_df.select(
+    "species",
+    code=pl.col("species").cast(pl.Enum(["Adelie", "Chinstrap", "Gentoo"])).to_physical(),
+).unique(maintain_order=True)
+```
+
+These codes are 0-based, where `as.integer(factor)` is 1-based.
+
+### Integer widths and literal dtypes {#sec-dm-integers}
+
+| dtype | range | dtype | range |
+|---|---|---|---|
+| `Int8` | −128 … 127 | `UInt8` | 0 … 255 |
+| `Int16` | −32,768 … 32,767 | `UInt16` | 0 … 65,535 |
+| `Int32` | ±2.1 × 10⁹ | `UInt32` | 0 … 4.3 × 10⁹ |
+| `Int64` | ±9.2 × 10¹⁸ | `UInt64` | 0 … 1.8 × 10¹⁹ |
+
+: Integer dtypes {.striped}
+
+`read_csv()` and Python integers both default to `Int64`, twice the width of
+R's integer. Smaller widths save memory (@sec-dm-recipes) at the price of
+overflow risk (@sec-dm-gotchas).
+
+When an expression combines two dtypes, Polars computes a **supertype**, much
+like `vctrs::vec_ptype2()`. A Python literal is more flexible: it takes the
+column's dtype and widens it only if the value doesn't fit:
+
+```{python}
+narrow_df = pl.DataFrame({
+    "x_i8": pl.Series([1, 2], dtype=pl.Int8),
+    "x_f32": pl.Series([1.0, 2.0], dtype=pl.Float32),
+})
+
+narrow_df.select(
+    lit_alone=pl.lit(1),             # Int32
+    plus_1=pl.col("x_i8") + 1,       # stays Int8
+    plus_1000=pl.col("x_i8") + 1000, # 1000 doesn't fit in Int8 → Int16
+    times_2_5=pl.col("x_f32") * 2.5, # stays Float32
+)
+```
+
+| Left | Right | Result |
+|---|---|---|
+| `Int32` | `Int64` | `Int64` |
+| `Int64` | `Float32` | `Float64` |
+| `UInt64` | `Int64` | `Int128` |
+| `Int8` | literal `1000` | `Int16` |
+
+: Supertypes of column-vs-column arithmetic (verified on Polars 2.0) {.striped}
+
+### Casting is strict {#sec-dm-casting}
+
+`cast()` fails if **any** value can't be converted, and the error lists the
+values that failed:
+
+```{python}
+#| error: true
+pl.Series(["1", "2", "x"]).cast(pl.Int64)
+```
+
+`strict=False` turns those values into null. That is what R's `as.integer()`
+does, but without the warning:
+
+```{python}
+pl.Series(["1", "2", "x"]).cast(pl.Int64, strict=False).to_list()
+```
+
+| Conversion | R | Polars `cast()` | `strict=False` |
+|---|---|---|---|
+| `"x"` → integer | `NA` + warning | error | null |
+| `"3.7"` → integer | `3` | error (cast to `Float64` first) | null |
+| `3.7` → integer | `3` | `3` (truncates toward zero) | `3` |
+| `NaN` → integer | `NA` | error | null |
+| `300` → `Int8` | (no `Int8`) | error | null; `wrap_numerical=True` gives `44` |
+| `"true"` → logical | `TRUE` | not supported: use `pl.col("x") == "true"` | — |
+| `1.0` → string | `"1"` | `"1.0"` | — |
+
+: Casting rules compared {.striped}
+
+To cast a whole frame, pass a `{column: dtype}` mapping. Selectors work as keys
+too:
+
+```{python}
+penguins_df.cast({"year": pl.Int16, cs.float(): pl.Float32}).schema
+```
+
+### Decimal: exact arithmetic {#sec-dm-decimal}
+
+Floats are binary fractions, so `0.1 + 0.2` is not exactly `0.3`. `Decimal`
+stores base-10 digits with a fixed scale, so values add up exactly. R has no
+built-in equivalent.
+
+```{python}
+prices = pl.Series(["0.10", "0.20"])
+prices.cast(pl.Float64).sum(), prices.cast(pl.Decimal(10, 2)).sum()
+```
+
+Use it for money and for anything that has to add up exactly.
+
+### The schema is an object {#sec-dm-schema}
+
+`df.schema` is a `pl.Schema`, an ordered mapping from column name to dtype,
+like `vapply(df, class, "")` but a real object you can pass around:
+
+```{python}
+penguins_schema = penguins_df.schema
+penguins_schema.names()[:3], penguins_schema.dtypes()[:3], penguins_schema["year"]
+```
+
+The same mapping works as an input: `pl.DataFrame(data, schema=...)`,
+`pl.read_csv(..., schema_overrides=...)`, `df.cast(...)`, and
+`df.match_to_schema(...)` (@sec-dm-recipes).
+
+## Where it bites {#sec-dm-gotchas}
+
+| R behaviour | Polars behaviour |
+|---|---|
+| `c(1L, 2.5)` coerces to double | `pl.Series([1, 2.5])` raises; pass `dtype=` or `strict=False` |
+| `bind_rows()` coerces integer + double | `pl.concat()` raises; use `how="vertical_relaxed"` |
+| `as.integer("x")` → `NA` with a warning | `cast()` raises; `strict=False` gives null without a warning |
+| integer overflow → `NA` with a warning | integer arithmetic **wraps silently** |
+| counts (`n()`) are signed integers | counts and ranks are `UInt32` and wrap below zero |
+| integers are 32-bit | the default integer is `Int64` |
+
+: The differences at a glance {.striped}
+
+### Integer arithmetic wraps silently {#sec-dm-overflow}
+
+```{python}
+pl.select(
+    int8_wrap=pl.lit(127, dtype=pl.Int8) + 1,
+    int64_wrap=pl.lit(2**63 - 1, dtype=pl.Int64) + 1,
+)
+```
+
+R would return `NA` and warn. Polars returns a wrong number, with no warning. In
+practice this happens after you shrink dtypes to save memory. Shrink `flights`
+(@sec-dm-recipes) and `dep_delay` becomes `Int16`, which holds values up to
+32,767:
+
+```{python}
+int_cols = flights_df.select(cs.integer()).columns
+flights_df_small = flights_df.with_columns(flights_df[c].shrink_dtype() for c in int_cols)
+
+flights_df_small.filter(pl.col("dep_delay") == pl.col("dep_delay").max()).select(
+    "dep_delay",
+    delay_x100=pl.col("dep_delay") * 100,                    # Int16: 130,100 wraps
+    delay_x100_ok=pl.col("dep_delay").cast(pl.Int64) * 100,  # widen first
+)
+```
+
+Aggregations are protected: `sum()` of a narrow integer column returns
+`Int64`. Element-wise arithmetic is not.
+
+**Rule:** keep narrow dtypes for storage, and widen before arithmetic that can
+grow values.
+
+### Counts are unsigned {#sec-dm-unsigned}
+
+`pl.len()`, `.count()`, `.n_unique()`, `.null_count()`, `.arg_*()`,
+`with_row_index()`, and `rank()` with the `"min"`, `"max"`, `"dense"` or
+`"ordinal"` methods all return `UInt32`. Subtracting past zero wraps around to
+about 4.3 billion:
+
+```{python}
+penguins_df.group_by("species", maintain_order=True).agg(
+    n=pl.len(),
+    n_minus_100=pl.len() - 100,                     # Chinstrap: 68 − 100 → 4294967264
+    n_minus_100_ok=pl.len().cast(pl.Int64) - 100,
+)
+```
+
+`rank()` with the default `"average"` method returns `Float64`, so it is safe.
+
+### Hand-built frames don't coerce {#sec-dm-construction}
+
+Mixed Python values do not coerce, which bites when you type test data by hand:
+
+```{python}
+#| error: true
+pl.DataFrame({"dose": [1, 2.5]})     # R: tibble(dose = c(1L, 2.5)) → double
+```
+
+```{python}
+pl.DataFrame({"dose": [1, 2.5]}, schema={"dose": pl.Float64})
+```
+
+(`[1.0, 2]` works, because the first value sets the dtype to `Float64` and
+`2` fits it.) Row-binding behaves the same way:
+
+```{python}
+#| error: true
+pl.concat([pl.DataFrame({"a": [1]}), pl.DataFrame({"a": [2.5]})])
+```
+
+```{python}
+pl.concat([pl.DataFrame({"a": [1]}), pl.DataFrame({"a": [2.5]})], how="vertical_relaxed")
+```
+
+## Recipes {#sec-dm-recipes}
+
+**Find the values that failed to parse** (≈ `readr::problems()`). Cast with
+`strict=False`, then keep the rows that were not null before but are null
+after:
+
+```{python}
+doses_df_raw = pl.DataFrame({"dose_mg": ["10", "12.5", "n/a", "15", None, "2,5"]})
+
+doses_df_parsed = doses_df_raw.with_columns(
+    dose_num=pl.col("dose_mg").cast(pl.Float64, strict=False)
+)
+doses_df_parsed.filter(pl.col("dose_mg").is_not_null() & pl.col("dose_num").is_null())
+```
+
+**Shrink a frame's memory.** `Series.shrink_dtype()` picks the narrowest
+integer width that fits each column (`Expr.shrink_dtype()` was removed in 2.0):
+
+```{python}
+{
+    "flights_df (MB)": round(flights_df.estimated_size("mb"), 1),
+    "flights_df_small (MB)": round(flights_df_small.estimated_size("mb"), 1),
+}
+```
+
+```{python}
+flights_df_small.select(cs.integer()).schema
+```
+
+Then watch for overflow when you compute on the result (@sec-dm-overflow).
+
+**Check a schema at the boundary** (≈ `pointblank::col_schema_match()`).
+`match_to_schema()` reorders columns to match the target and raises if a
+column is missing, extra, or has the wrong dtype. It is marked
+**unstable** in 2.0.
+
+```{python}
+#| error: true
+penguins_expected = pl.Schema({**penguins_df.schema, "year": pl.String})
+penguins_df.match_to_schema(penguins_expected)
+```
+
+Options such as `extra_columns="ignore"` and `integer_cast="upcast"` relax
+individual rules.
+
+## See also {#sec-dm-see-also}
+
+- Cheatsheet:
+  [Import, Export & Inspect](../overview/polars-cheatsheet.qmd#sec-cs-io) ·
+  [Create & Modify Columns](../overview/polars-cheatsheet.qmd#sec-cs-mutate)
+  (type conversion)
+- Next: [Expressions & Contexts](expressions.qmd) ·
+  [Missing Values](../types/missing.qmd) (null vs `NaN`) ·
+  [Lazy API](../scale/lazy.qmd)
+- Polars user guide:
+  [Data types and structures](https://docs.pola.rs/user-guide/concepts/data-types-and-structures/) ·
+  [Casting](https://docs.pola.rs/user-guide/expressions/casting/)
+- Python API: [Data types](https://docs.pola.rs/api/python/stable/reference/datatypes.html) ·
+  [`match_to_schema`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.match_to_schema.html)
+- R side: *Advanced R*, [Vectors](https://adv-r.hadley.nz/vectors-chap.html) and
+  [Names and values](https://adv-r.hadley.nz/names-values.html) (copy-on-modify)

@@ -1,0 +1,586 @@
+---
+title: "Window Functions"
+subtitle: "≈ grouped `mutate()` · dplyr window functions · slider"
+jupyter: python3
+---
+
+A window function returns one value per input row, computed from a set of
+related rows: the row's group, the rows before it, or the rows within three
+hours of it. [Expressions & Contexts](../core/expressions.qmd#sec-expr-contexts)
+introduced `.over()` as grouped `mutate()`. This chapter covers the rest: how
+a window is partitioned, ordered and mapped back; offsets, cumulative
+functions, ranks and rolling windows; and the places where row order silently
+changes the answer.
+
+## In tidyverse {#sec-win-tidyverse}
+
+```r
+library(dplyr)
+library(nycflights13)
+
+flights |>
+  mutate(
+    day_avg  = mean(dep_delay, na.rm = TRUE),   # aggregate, broadcast back
+    day_rank = min_rank(desc(dep_delay)),       # rank within the day
+    .by = c(month, day)
+  )
+
+flights |>
+  arrange(time_hour, minute) |>                       # order the frame first ...
+  mutate(prev_delay = lag(dep_delay), .by = tailnum)  # ... then lag within each plane
+
+weather |>
+  mutate(temp_3h = slider::slide_index_dbl(temp, time_hour, mean, .before = hours(2)), .by = origin)
+```
+
+dplyr spreads a window over three places: `.by` partitions, `arrange()` (or
+`order_by =`) orders, and the function picks the frame. Most window functions
+see the whole group, cumulative ones see the group up to the current row, and
+a sliding frame needs slider. Polars puts all three into one expression:
+
+| Part of the window | SQL | dplyr | Polars |
+|---|---|---|---|
+| Partition | `PARTITION BY g` | `.by = g` | `.over("g")` |
+| Order | `ORDER BY t` | `arrange(t)` first; `lag(x, order_by = t)`; `order_by(t, cumsum(x))` | `.over(..., order_by="t")` |
+| Frame: last *k* rows | `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` | `slider::slide_dbl(.before = 2)` | `.rolling_mean(3)` |
+| Frame: last 3 hours | `RANGE` frame | `slider::slide_index_dbl()` | `.rolling_mean_by("t", "3h")` |
+| Rows returned | one per input row | one per input row | `mapping_strategy=` decides |
+
+: The parts of a window {.striped}
+
+## Mental model {#sec-win-model}
+
+```text
+ pl.col("x").cum_sum().over("g", order_by="t")
+
+ input            ① partition by g    ② order by t       ③ evaluate     ④ write back by row id
+ row g t   x         (keep row ids)      (inside group)     per group
+  0  a 3  30      a: rows 0 2 4  ──►  rows 2 4 0   ──►   10 30 60  ──►    row g t   x   cs
+  1  b 1 100      b: rows 1 3    ──►  rows 1 3     ──►   100 300   ──►     0  a 3  30   60
+  2  a 1  10                                                               1  b 1 100  100
+  3  b 2 200                                                               2  a 1  10   10
+  4  a 2  20                                                               3  b 2 200  300
+                                                                           4  a 2  20   30
+```
+
+- **`group_by().agg()` stops after ③**, one row per group (cheatsheet
+  [diagram](../overview/polars-cheatsheet.qmd#sec-cs-summarise)). `.over()`
+  adds ④: each result goes back to its row, so rows never move.
+- **Without `order_by=`, step ② is skipped.** "Previous" then means the
+  previous row *in the frame*, whatever order the frame happens to be in.
+- **`mapping_strategy=` replaces ④** with a list per row or stacked results
+  (@sec-win-mapping).
+
+## Mechanics {#sec-win-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import datetime as dt
+
+import polars as pl
+from pl_notes import datasets
+
+flights_df = datasets.flights().with_columns(
+    # time_hour is the scheduled hour; add the minute for the exact scheduled departure
+    sched_dep=pl.col("time_hour") + pl.duration(minutes=pl.col("minute")),
+)
+weather_df = datasets.weather()
+penguins_df = datasets.penguins()
+
+toy_df = pl.DataFrame({
+    "g": ["a", "b", "a", "b", "a"],
+    "t": [3, 1, 1, 2, 2],
+    "x": [30, 100, 10, 200, 20],
+})
+```
+
+### Partition keys {#sec-win-partition}
+
+One key, several keys (positional or a list), or any expression:
+
+```{python}
+flights_df.select(
+    "origin", "month", "dep_delay",
+    origin_avg=pl.col("dep_delay").mean().over("origin"),
+    origin_month_avg=pl.col("dep_delay").mean().over("origin", "month"),
+    flights_that_day=pl.len().over(pl.col("sched_dep").dt.date()),
+).head(3)
+```
+
+`.over()` windows the expression it is called on, and nothing else. In
+`pl.col("x").cum_sum() - pl.col("x").sum().over("g")` the `cum_sum()` runs over
+the whole frame. To window a whole formula, wrap it:
+`(pl.col("x").cum_sum() - pl.col("x").sum()).over("g")` (z-score recipe in
+@sec-win-recipes).
+
+### `order_by=`: order inside the window {#sec-win-order}
+
+```{python}
+toy_df.with_columns(
+    cs_rows=pl.col("x").cum_sum().over("g"),               # frame order
+    cs_t=pl.col("x").cum_sum().over("g", order_by="t"),    # t order, as in the diagram
+    first_t=pl.col("x").first().over("g", order_by="t"),   # ≈ first(x, order_by = t)
+    cs_all=pl.col("x").cum_sum().over(order_by="t"),       # no partition: whole frame in t order
+)
+```
+
+`order_by=` sorts inside each group, evaluates, and writes back, so the frame
+keeps its row order: dplyr's `lag(x, order_by = t)`, generalised to every
+expression. `toy_df.sort("t")` plus a plain `.over("g")` gives the same numbers
+in a new row order. That works when every window shares one order; `order_by=`
+lets windows differ and keeps the rows where they are. It takes several keys
+(`["t", "x"]`); `descending=` and `nulls_last=` are one bool for all keys, so
+for mixed directions order by an expression such as `-pl.col("t")`. Nulls in
+the key come first (@sec-win-nulls).
+
+### `mapping_strategy=`: what comes back {#sec-win-mapping}
+
+```text
+ pl.col("x").sort(descending=True).head(2).over("g", mapping_strategy=...)
+ group a → [30, 20]      group b → [200, 100]
+
+ "group_to_rows" (default)  each group must return 1 value or exactly its own row count, else ShapeError
+ "join"                     every row of the group gets the whole result as a list
+ "explode"                  the results are stacked group after group: 4 rows, not 5
+```
+
+Two values from the three-row group `a` can't map back to rows:
+
+```{python}
+#| error: true
+toy_df.with_columns(top2=pl.col("x").sort(descending=True).head(2).over("g"))
+```
+
+`"join"` attaches the group's result to each of its rows. A scalar result
+stays a scalar, not a one-element list:
+
+```{python}
+toy_df.with_columns(
+    top2=pl.col("x").sort(descending=True).head(2).over("g", mapping_strategy="join"),
+    avg=pl.col("x").mean().over("g", mapping_strategy="join"),
+)
+```
+
+`"explode"` changes the row count, so it belongs in `select()` with every
+column passed through the same window. Groups come out in order of first
+appearance, as with `group_by(maintain_order=True).agg(...)` plus `explode()`.
+Top two delays per origin (≈ `slice_max(dep_delay, n = 2, with_ties = FALSE,
+by = origin)`; `top_k_by` skips nulls):
+
+```{python}
+flights_df.select(
+    pl.col("origin", "carrier", "dep_delay")
+    .top_k_by("dep_delay", k=2)
+    .over("origin", mapping_strategy="explode")
+)
+```
+
+### Grouped filter {#sec-win-filter}
+
+A window inside `filter()` is dplyr's `filter(..., .by = g)`. Planes with at
+least 500 flights (≈ `filter(n() >= 500, .by = tailnum)`):
+
+```{python}
+flights_df.filter(pl.len().over("tailnum") >= 500)["tailnum"].unique().sort().to_list()
+```
+
+The `None` is real: the 2,512 flights with no `tailnum` form one group, like
+`NA` in a dplyr group. Add `pl.col("tailnum").is_not_null()` to the filter.
+Top *n* and ties at the max are in @sec-win-recipes.
+
+### Combining windows {#sec-win-nested}
+
+Each expression carries its own window, so one context can mix partitions, and
+a window can take another window's output. Rank the three airports by mean
+delay within each month (in dplyr, two chained `mutate(.by)` calls): the inner
+window computes the origin-month mean, the outer one ranks it within the month.
+
+```{python}
+flights_df.select(
+    "month", "origin",
+    origin_rank=pl.col("dep_delay").mean().over("origin", "month").rank("dense").over("month"),
+).unique().sort("month", "origin_rank").head(6)
+```
+
+Every row of an airport carries the same mean, a block of thousands of ties.
+`"dense"` numbers the blocks 1, 2, 3; `"min"` would give each block the row
+position where it starts.
+
+### Offsets: `shift`, `diff`, `pct_change` {#sec-win-offsets}
+
+The R ↔ Polars names are in the cheatsheet's
+[Window & Ranking](../overview/polars-cheatsheet.qmd#sec-cs-window) table.
+What matters here is how nulls behave:
+
+```{python}
+gaps_df = pl.DataFrame({"x": [1, None, 3, 4, None, 10]})
+
+gaps_df.with_columns(
+    lag=pl.col("x").shift(1),
+    lead=pl.col("x").shift(-1),
+    lag2=pl.col("x").shift(2, fill_value=0),
+    diff=pl.col("x").diff(),
+    pct=pl.col("x").pct_change(),
+)
+```
+
+- `diff()` and `pct_change()` need both neighbours, so a null also nulls the
+  row after it. `pct_change()` is exactly `x / x.shift() - 1`, with no forward
+  fill.
+- `n` and `fill_value=` accept expressions: `shift(1, fill_value=pl.col("x").mean())`.
+- `diff(null_behavior="drop")` returns *n* − 1 rows, like base R's `diff()`,
+  so it only fits in `select()` or `agg()`.
+
+### Cumulative functions {#sec-win-cumulative}
+
+```{python}
+gaps_df.with_columns(
+    cum_sum=pl.col("x").cum_sum(),
+    cum_count=pl.col("x").cum_count(),                       # non-null values so far
+    cum_max=pl.col("x").cum_max(),
+    cum_mean=pl.col("x").cum_sum() / pl.col("x").cum_count(),
+    cum_sum_rev=pl.col("x").cum_sum(reverse=True),           # ≈ rev(cumsum(rev(x)))
+)
+```
+
+R's `cumsum(c(1, NA, 3, 4, NA, 10))` is `1 NA NA NA NA NA`: one `NA` ends the
+running total. Polars keeps the null at its own position and carries on. There
+is no `cum_mean()`; `cum_sum() / cum_count()` skips nulls the same way.
+
+Dtypes: `cum_count()` is `UInt32`, and so is `cum_sum()` of a Boolean (a
+running count of `true`). `cum_sum()` widens `Int8`/`Int16` to `Int64`, but a
+`UInt32` column stays `UInt32`.
+
+### Ranks and row numbers {#sec-win-rank}
+
+| `rank(method=)` | Ties get | R | dtype |
+|---|---|---|---|
+| `"average"` (default) | the mean of their positions | `rank(x)` | `Float64` |
+| `"min"` | the lowest position | `min_rank(x)` | `UInt32` |
+| `"max"` | the highest position | `rank(x, ties.method = "max")` | `UInt32` |
+| `"dense"` | consecutive integers, no gaps | `dense_rank(x)` | `UInt32` |
+| `"ordinal"` | distinct ranks, in row order | `row_number(x)` | `UInt32` |
+| `"random"` | distinct ranks, at random (`seed=`) | `rank(x, ties.method = "random")` | `UInt32` |
+
+: `rank()` methods {.striped}
+
+```{python}
+ranks_df = pl.DataFrame({"x": [20, 10, 20, None, 30, 10]})
+
+ranks_df.with_columns(
+    average=pl.col("x").rank(),
+    min=pl.col("x").rank("min"),
+    max=pl.col("x").rank("max"),
+    dense=pl.col("x").rank("dense"),
+    ordinal=pl.col("x").rank("ordinal"),
+    min_desc=pl.col("x").rank("min", descending=True),        # ≈ min_rank(desc(x))
+    percent_rank=(pl.col("x").rank("min") - 1) / (pl.col("x").count() - 1),
+    cume_dist=pl.col("x").rank("max") / pl.col("x").count(),
+)
+```
+
+- A null gets a null rank, as in dplyr. `NaN` is not null: it ranks above
+  every number, where R treats it as missing.
+- dplyr's `percent_rank()` and `cume_dist()` divide by the number of
+  non-missing values, hence `.count()`. `pl.len()` counts nulls too: the 20s
+  would get 0.4 and 0.667 instead of 0.5 and 0.8.
+- The `UInt32` ranks are the [counts-are-unsigned](../core/data-model.qmd#sec-dm-unsigned)
+  gotcha: a rank difference such as `rank_a - rank_b` wraps to about 4.3
+  billion instead of going negative. Cast one side to `Int64` first.
+
+A **row number** ignores values: `pl.int_range(pl.len())` gives 0, 1, 2, … per
+group (`Int64`). `"ordinal"` breaks ties by row order, and inside `.over()`
+that means the `order_by=` order:
+
+```{python}
+pl.DataFrame({"g": ["a"] * 3, "t": [3, 1, 2], "x": [10, 10, 30]}).with_columns(
+    row_number=pl.int_range(1, pl.len() + 1).over("g", order_by="t"),   # ≈ row_number() after arrange(t)
+    ordinal_rows=pl.col("x").rank("ordinal").over("g"),
+    ordinal_t=pl.col("x").rank("ordinal").over("g", order_by="t"),
+)
+```
+
+Don't use `cum_count()` as a row number: it skips nulls.
+
+### Rolling windows by rows {#sec-win-rolling}
+
+`rolling_mean`, `_sum`, `_min`, `_max`, `_median`, `_std`, `_var` and
+`rolling_quantile(q, window_size=)` take a window of `window_size` rows ending
+at the current row:
+
+```{python}
+roll_df = pl.DataFrame({"x": [1, 2, 3, None, 5, 6, 7]})
+
+roll_df.with_columns(
+    mean3=pl.col("x").rolling_mean(3),
+    mean3_min1=pl.col("x").rolling_mean(3, min_samples=1),
+    mean3_center=pl.col("x").rolling_mean(3, center=True),
+    max3=pl.col("x").rolling_max(3),
+)
+```
+
+- **`min_samples=`** is the number of non-null values a window needs. The
+  default `None` means `window_size`, so a window that holds a null, or is
+  still short at the start, gives null; `min_samples=1` skips nulls instead.
+  The old name `min_periods` raises `ArgumentRemovedError` in 2.0.
+- **`center=True`**: with an even window the extra row goes before the
+  current one (`rolling_mean(4, center=True)` covers *i* − 2 … *i* + 1).
+- **`weights=`** multiplies the window element-wise, oldest row first.
+  `rolling_mean()` divides by the sum of the weights; `rolling_sum()` doesn't.
+  On a column with nulls, weights raise a `PanicException` ("weights not yet
+  supported on array with null values"): fill the nulls first.
+
+| R | Polars |
+|---|---|
+| `zoo::rollmeanr(x, 3, fill = NA)` | `rolling_mean(3)` |
+| `zoo::rollmean(x, 3, fill = NA)` (centred) | `rolling_mean(3, center=True)` |
+| `slider::slide_dbl(x, mean, .before = 2, .complete = TRUE)` | `rolling_mean(3)` |
+| `slider::slide_dbl(x, mean, .before = 2)` (partial windows) | `rolling_mean(3, min_samples=1)`, but nulls are skipped, not `NA` |
+| `slider::slide_dbl(x, mean, .before = 1, .after = 1, .complete = TRUE)` | `rolling_mean(3, center=True)` |
+| `mutate(m = slide_dbl(...), .by = g)` after `arrange(t)` | `rolling_mean(3).over("g", order_by="t")` |
+
+: Row-based rolling windows {.striped}
+
+### Rolling windows by time {#sec-win-rolling-time}
+
+`rolling_*_by(by, window_size)` defines the window by a time (or integer)
+column instead of a row count. By default it is `(t − window_size, t]`:
+
+```{python}
+times_df = pl.DataFrame({
+    "t": [dt.datetime(2013, 1, 1, h) for h in [0, 1, 1, 2, 5]],
+    "x": [1, 2, 3, 4, 5],
+})
+
+times_df.with_columns(
+    rows3=pl.col("x").rolling_sum(3, min_samples=1),
+    right=pl.col("x").rolling_sum_by("t", "3h"),                  # (t − 3h, t]
+    both=pl.col("x").rolling_sum_by("t", "3h", closed="both"),    # [t − 3h, t]
+)
+```
+
+- **Ties share a window.** Both 01:00 rows get 6: the first one's window
+  includes the second, which comes after it. Row-based `rows3` gives 3 and 6.
+- **`closed=`** is `"right"` (default), `"both"`, `"left"` or `"none"`. At
+  05:00 the 02:00 row sits on the boundary: `"right"` leaves it out, `"both"`
+  keeps it. slider's index windows include both ends, so
+  `slide_index_dbl(.before = hours(3))` is `closed="both"`, and
+  `.before = hours(2)` on hourly data is the default `"3h"`.
+- **`min_samples` defaults to 1** here, not to the window size.
+- The window is a duration string: `"3h"`, `"30m"` (minutes), `"7d"`, `"1mo"`
+  (see [Dates & Times](../types/datetime.qmd)).
+
+Row and time windows differ only where the data has gaps. `weather` is
+hourly, but EWR has no reading for noon on 1 January:
+
+```{python}
+weather_df.with_columns(
+    temp_3rows=pl.col("temp").rolling_mean(3).over("origin", order_by="time_hour"),
+    temp_3h=pl.col("temp").rolling_mean_by("time_hour", "3h").over("origin"),
+).filter(
+    pl.col("origin") == "EWR", pl.col("month") == 1, pl.col("day") == 1,
+    pl.col("hour").is_between(10, 15),
+).select("time_hour", "temp", "temp_3rows", "temp_3h")
+```
+
+At 13:00, three rows reach back to 10:00 (four hours); the three-hour window
+holds only 11:00 and 13:00.
+
+Beyond the built-ins, `pl.col("x").sum().rolling("t", period="3h")` runs *any*
+expression over a time window, and `df.rolling()` / `df.group_by_dynamic()`
+are the frame-level versions. All three need a sorted index (@sec-win-sorted).
+Exponentially weighted windows are `ewm_mean()`, `ewm_std()` and `ewm_var()`.
+
+## Where it bites {#sec-win-gotchas}
+
+| tidyverse behaviour | Polars behaviour |
+|---|---|
+| `arrange()` then `mutate(.by)` reads sorted rows | `.over()` reads frame order unless you pass `order_by=` |
+| `arrange()` puts `NA` last | `order_by=` puts nulls first, even with `descending=True` |
+| `cumsum()` turns everything after an `NA` into `NA` | `cum_*` skip nulls |
+| `percent_rank()` divides by the non-`NA` count | `pl.len()` counts nulls: divide by `.count()` |
+| ranks are integer or double | ranks are `UInt32` and wrap on subtraction |
+| `mutate()` always returns one row per input row | `mapping_strategy="explode"` changes the count and the order |
+
+: The differences at a glance {.striped}
+
+### Row order is not time order {#sec-win-row-order}
+
+`flights` is stored by month, but in the order 1, 10, 11, 12, 2, …, and within
+a day by actual departure time with cancelled flights last:
+
+```{python}
+flights_df["month"].unique(maintain_order=True).to_list()
+```
+
+So `shift()`, `diff()` and `cum_*()` without `order_by=` compute "previous" in
+that order. Count the negative gaps between consecutive flights of a plane:
+
+```{python}
+flights_df.select(
+    gaps_in_row_order=(pl.col("sched_dep").diff().over("tailnum") < pl.duration()).sum(),
+    gaps_in_time_order=(
+        pl.col("sched_dep").diff().over("tailnum", order_by="sched_dep") < pl.duration()
+    ).sum(),
+)
+```
+
+6,906 wrong answers and no error. Every order-dependent window needs either
+`order_by=` or a frame you sorted yourself.
+
+### `sort_by()` inside `.over()` misaligns {#sec-win-sort-by}
+
+`sort_by()` looks like a way to order a window, but it reorders the values
+*before* step ④, which still writes back by original position:
+
+```{python}
+toy_df.with_columns(
+    right=pl.col("x").cum_sum().over("g", order_by="t"),
+    wrong=pl.col("x").sort_by("t").cum_sum().over("g"),
+)
+```
+
+Row 0 (`t = 3`) should be 60; `wrong` gives it 10, the running total of the
+row with `t = 1`. It is the [expression `sort()` trap](../core/expressions.qmd#sec-expr-sort-trap)
+inside a window. `sort_by()` is safe only when the result leaves as a list or
+as new rows (`"join"`, `"explode"`, or inside `agg()`).
+
+### `shift()` without `.over()` crosses groups {#sec-win-leak}
+
+Even on a sorted frame, a plain `shift()` hands the last value of one group to
+the first row of the next, like `lag()` without `.by`:
+
+```{python}
+toy_df.sort("g", "t").with_columns(
+    lag_frame=pl.col("x").shift(),
+    lag_group=pl.col("x").shift().over("g"),
+)
+```
+
+### `"explode"` inside `with_columns()` misaligns {#sec-win-explode}
+
+If the window returns one value per row, `"explode"` keeps the row count, so
+`with_columns()` accepts it. The values come out grouped (all of `a`, then all
+of `b`) and land next to rows in the original order:
+
+```{python}
+toy_df.with_columns(x_exploded=pl.col("x").over("g", mapping_strategy="explode"))
+```
+
+Row 1 is group `b` with `x = 100`, yet `x_exploded` is 10. Use `"explode"` only
+in `select()`, with every column through the same window (@sec-win-mapping).
+
+### Nulls in the order key {#sec-win-nulls}
+
+Nulls in `order_by=` sort first, and `descending=True` does not move them;
+only `nulls_last=True` does:
+
+```{python}
+pl.DataFrame({"t": [2, None, 1, 3], "x": [20, 99, 10, 30]}).with_columns(
+    nulls_first=pl.col("x").cum_sum().over(order_by="t"),
+    desc=pl.col("x").cum_sum().over(order_by="t", descending=True),
+    nulls_last=pl.col("x").cum_sum().over(order_by="t", nulls_last=True),
+)
+```
+
+### Sorted index: `rolling_*_by()` vs `rolling()` {#sec-win-sorted}
+
+`rolling_*_by()` accepts an unsorted `by` column (on `times_df.reverse()` it
+returns the same values, row for row). The `rolling()` forms don't:
+
+```{python}
+#| error: true
+times_df.reverse().with_columns(s=pl.col("x").sum().rolling("t", period="3h"))
+```
+
+`df.rolling()` and `df.group_by_dynamic()` raise the same error. Sort by the
+index first (by group and index, if there are groups).
+
+## Recipes {#sec-win-recipes}
+
+**Top *n* per group, with or without ties.** `rank("min")` keeps ties, like
+`slice_max(n = 3)`; `rank("ordinal")` returns exactly *n*. On both days, two
+flights share third place:
+
+```{python}
+jan_df = flights_df.filter(pl.col("month") == 1, pl.col("day").is_in([20, 28]))
+
+jan_df.with_columns(
+    delay_rank=pl.col("dep_delay").rank("min", descending=True).over("day"),
+).filter(pl.col("delay_rank") <= 3).sort("day", "delay_rank", maintain_order=True).select(
+    "day", "origin", "carrier", "dep_delay", "delay_rank"
+)
+```
+
+**Change since the previous flight of the same plane.** Keep the window in a
+dict and reuse it, the role of SQL's named `WINDOW` clause:
+
+```{python}
+by_plane = {"partition_by": "tailnum", "order_by": "sched_dep"}
+
+flights_df.filter(pl.col("tailnum").is_not_null()).with_columns(
+    prev_dest=pl.col("dest").shift().over(**by_plane),
+    hours_since_prev=pl.col("sched_dep").diff().over(**by_plane).dt.total_hours(fractional=True),
+    delay_change=pl.col("dep_delay").diff().over(**by_plane),
+).filter(pl.col("tailnum") == "N14228").sort("sched_dep").select(
+    "month", "day", "dest", "dep_delay", "prev_dest", "hours_since_prev", "delay_change"
+).head(4)
+```
+
+**Running total per day, in time order.** Partition by date and origin, order
+by scheduled time. `cum_count()` on `dep_time` counts only flights that left,
+and the count resets at midnight:
+
+```{python}
+flights_df.with_columns(
+    n_departed=pl.col("dep_time").cum_count().over(
+        pl.col("sched_dep").dt.date(), "origin", order_by="sched_dep"
+    ),
+).filter(
+    pl.col("origin") == "JFK", pl.col("month") == 2, pl.col("day").is_in([7, 8])
+).sort("sched_dep", maintain_order=True).select(
+    "day", "sched_dep_time", "dep_time", "n_departed"
+).slice(299, 5)
+```
+
+**Deviation from the group mean, as a z-score.** Window the whole formula once
+(@sec-win-partition). The warmest hours relative to their airport and month:
+
+```{python}
+temp_z = (pl.col("temp") - pl.col("temp").mean()) / pl.col("temp").std()
+
+weather_df.select("origin", "time_hour", "temp", temp_z=temp_z.over("origin", "month")).sort(
+    "temp_z", "time_hour", descending=[True, False], nulls_last=True
+).head(3)
+```
+
+**Keep the rows equal to the group max, ties included** (≈
+`filter(x == max(x, na.rm = TRUE), .by = g)`). Two Gentoos share the deepest
+bill:
+
+```{python}
+penguins_df.filter(
+    pl.col("bill_depth_mm") == pl.col("bill_depth_mm").max().over("species")
+).select("species", "island", "sex", "bill_depth_mm")
+```
+
+## See also {#sec-win-see-also}
+
+- Cheatsheet:
+  [Window & Ranking Functions](../overview/polars-cheatsheet.qmd#sec-cs-window) ·
+  [Summarise & Group](../overview/polars-cheatsheet.qmd#sec-cs-summarise) ·
+  [Filter Rows](../overview/polars-cheatsheet.qmd#sec-cs-filter)
+- Before: [Expressions & Contexts](../core/expressions.qmd#sec-expr-contexts) ·
+  [Grouping & Aggregation](group-agg.qmd)
+- Next: [Dates, Times & Durations](../types/datetime.qmd) (duration strings,
+  time zones) · [Missing Values](../types/missing.qmd)
+- Polars user guide: [Window functions](https://docs.pola.rs/user-guide/expressions/window-functions/)
+- Python API: [`Expr.over`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.over.html) ·
+  [`Expr.rank`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.rank.html) ·
+  [`Expr.rolling_mean_by`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.rolling_mean_by.html)
+- R side: `vignette("window-functions", package = "dplyr")` ·
+  [slider](https://slider.r-lib.org/)

@@ -1,0 +1,569 @@
+---
+title: "Selectors & Expression Expansion"
+subtitle: "≈ tidyselect · `across()` · `if_any()` / `if_all()` · `c_across()`"
+jupyter: python3
+---
+
+dplyr uses three extra mechanisms for many columns: tidyselect picks them,
+`across()` maps functions over them, and `if_any()` / `if_all()` /
+`c_across()` work across a row. Polars has one: an expression whose root
+names **several columns** is rewritten into one expression per column before
+it runs. This chapter covers that rewrite, the `polars.selectors` algebra,
+the `across()` patterns built on it, the `*_horizontal` row-wise functions,
+and the places where a selector silently turns into arithmetic.
+
+## In tidyverse {#sec-sel-tidyverse}
+
+```r
+library(dplyr)
+library(palmerpenguins)
+
+penguins |>
+  summarise(
+    across(where(is.numeric) & !year,
+           list(mean = \(x) mean(x, na.rm = TRUE), sd = \(x) sd(x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    .by = species
+  )
+
+penguins |> filter(if_any(ends_with("_mm"), \(x) x > 50))
+
+penguins |> rowwise() |> mutate(mm_med = median(c_across(ends_with("_mm")))) |> ungroup()
+```
+
+tidyselect evaluates its helpers against the data frame, and `across()`
+loops over the result, naming outputs with glue. Polars replaces the
+selection with an object you can hold, and the loop with a rewrite.
+
+## Mental model {#sec-sel-model}
+
+```text
+ YOU WRITE ONE EXPRESSION          EXPANSION (needs only the schema)            CONTEXT RUNS N EXPRESSIONS
+ ─────────────────────────         ─────────────────────────────────────────    ──────────────────────────
+ cs.ends_with("_mm")               col("bill_length_mm").mean()                 bill_length_mm_mean
+   .mean()                ──────►      .alias("bill_length_mm_mean")    ──────► bill_depth_mm_mean
+   .name.suffix("_mean")           col("bill_depth_mm").mean() …                flipper_length_mm_mean
+                                   col("flipper_length_mm").mean() …
+```
+
+The root of the expression (`pl.col(...)`, a `cs.*` selector, `pl.all()`)
+is matched against column **names and dtypes**, never values. Every method
+chained after it is copied onto each match, and the context sees N ordinary
+expressions, as if you had typed them. So `across()` is not a function in
+Polars: it is what happens to any expression whose root matches more than one
+column. In Polars 2.0, every multi-column root is a selector under the hood:
+
+| You write | Internally | Expansion order |
+|---|---|---|
+| `pl.col("a")` | a single column | — |
+| `pl.col("a", "b")`, `pl.col(["a", "b"])` | `cs.by_name("a", "b")` | as listed |
+| `pl.col("^bill_.*$")` | `cs.matches("^bill_.*$")` | frame order |
+| `pl.col(pl.Float64)` | `cs.by_dtype([Float64])` | frame order |
+| `pl.all()` / `pl.exclude("a")` | `cs.all()` / `cs.all() - cs.by_name("a", require_all=False)` | frame order |
+| `pl.nth(0, -1)` / `pl.first()` | `cs.by_index(0, -1)` / `cs.first()` | as listed |
+| `cs.numeric()`, `cs.starts_with(...)` … | a `Selector` object | frame order |
+
+: The roots that expand {.striped}
+
+## Mechanics {#sec-sel-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import datetime as dt
+from decimal import Decimal
+
+import polars as pl
+import polars.selectors as cs
+from pl_notes import datasets
+
+penguins_df = datasets.penguins()
+flights_df = datasets.flights()
+```
+
+### One expression, many outputs {#sec-sel-expansion}
+
+```{python}
+bill_means = pl.col("bill_length_mm", "bill_depth_mm").mean()
+print(bill_means)
+penguins_df.select(bill_means)
+```
+
+It prints as a selector, `.meta.has_multiple_outputs()` is `True`, and
+`.meta.output_name()` raises: there is no single name. In a context it
+becomes two columns, each named after its own input.
+
+The lazy plan shows the rewrite: three ordinary expressions, the suffix
+turned into an `alias`:
+
+```{python}
+print(penguins_df.lazy().select(cs.ends_with("_mm").mean().name.suffix("_mean")).explain())
+```
+
+When a multi-output expression meets another operand, the output counts on
+each side decide:
+
+```text
+ many ⊕ one          [a, b] / c          →  a / c,  b / c     the single side is reused
+ many ⊕ many (same)  [a, b] / [c, d]     →  a / c,  b / d     zipped by position, not crossed
+ many ⊕ many (≠)     [a, b] / [c, d, e]  →  error
+```
+
+```{python}
+penguins_df.head(2).select(
+    pl.col("bill_length_mm", "bill_depth_mm") / pl.col("flipper_length_mm", "body_mass_g")
+)
+```
+
+39.1 / 181 = 0.216 and 18.7 / 3750 = 0.005: zipped, and named after the left
+side. Different counts raise:
+
+```{python}
+#| error: true
+penguins_df.select(cs.ends_with("_mm") / pl.col("body_mass_g", "year"))
+```
+
+### `pl.col()`: names, patterns, dtypes {#sec-sel-col}
+
+A string is a **pattern** only if it starts with `^` and ends with `$`:
+
+```{python}
+(
+    penguins_df.select(pl.col("year", "species")).columns,
+    penguins_df.select(pl.col("^bill_.*$")).columns,
+    penguins_df.select(pl.col(pl.Int64, pl.Float64)).columns,
+)
+```
+
+Names keep the order you list and raise `ColumnNotFoundError` if missing.
+Patterns (Rust regex syntax) and dtypes keep frame order, and a pattern that
+matches nothing returns zero columns without an error. A dtype class
+(`pl.Datetime`) matches every parameterization; an instance
+(`pl.Datetime("us")`) matches exactly (@sec-sel-dtype-trap). Older dtype
+groups such as `pl.NUMERIC_DTYPES` don't exist in 2.0: use `cs.numeric()`.
+
+### The `polars.selectors` catalogue {#sec-sel-cs}
+
+One-line translations are in the cheatsheet
+([Select Columns](../overview/polars-cheatsheet.qmd#sec-cs-select)). The full
+set, grouped by what each selector looks at:
+
+| Looks at | Polars | tidyselect |
+|---|---|---|
+| dtype | `cs.numeric()`, `cs.integer()`, `cs.signed_integer()`, `cs.unsigned_integer()`, `cs.float()`, `cs.decimal()` | `where(is.numeric)`, `where(is.integer)`, `where(is.double)` |
+| | `cs.string()`, `cs.categorical()`, `cs.enum()`, `cs.boolean()`, `cs.binary()` | `where(is.character)`, `where(is.factor)`, `where(is.logical)` |
+| | `cs.temporal()`, `cs.date()`, `cs.datetime(time_unit, time_zone)`, `cs.duration()`, `cs.time()` | `where(is.Date)`, `where(is.POSIXct)` (lubridate) |
+| | `cs.nested()`, `cs.list()`, `cs.array()`, `cs.struct()`, `cs.by_dtype(...)` | `where(is.list)`, `where(is.data.frame)` |
+| name | `cs.by_name(..., require_all=True)` | `all_of()`; `require_all=False` ≈ `any_of()` |
+| | `cs.starts_with()`, `cs.ends_with()`, `cs.contains()`: literal; several args = OR | `starts_with()`, `ends_with()`, `contains()` |
+| | `cs.matches(regex)`: unanchored, unlike `pl.col()` | `matches()` |
+| position | `cs.by_index(0, -1)`, `cs.by_index(range(2, 6))`, `cs.first()`, `cs.last()` | `c(1, last_col())`, `3:6` |
+| everything | `cs.all()`, `cs.exclude(...)`, `cs.empty()` | `everything()`, `-c(...)` |
+
+: Selector catalogue (positions are 0-based) {.striped}
+
+There is no name range like `bill_length_mm:body_mass_g` (use
+`cs.by_index(range(...))`), and no `where(fn)` that inspects values:
+selectors see only the schema (@sec-sel-recipes has the workaround).
+
+Group membership is not always what an R user expects. A frame with one
+column per dtype:
+
+```{python}
+dtype_zoo_df = pl.DataFrame(
+    {
+        "i64": [1], "u32": [1], "f64": [1.0], "dec": [Decimal("1.5")], "bool": [True],
+        "str": ["a"], "cat": ["a"], "enum": ["a"], "date": [dt.date(2025, 1, 1)],
+        "dtm": [dt.datetime(2025, 1, 1)], "dtm_utc": [dt.datetime(2025, 1, 1, tzinfo=dt.UTC)],
+        "dur": [dt.timedelta(days=1)], "time": [dt.time(9)], "list": [[1]], "struct": [{"a": 1}],
+    },
+    schema_overrides={"u32": pl.UInt32, "cat": pl.Categorical, "enum": pl.Enum(["a"])},
+)
+
+{
+    name: cs.expand_selector(dtype_zoo_df, getattr(cs, name)())
+    for name in ["numeric", "integer", "categorical", "temporal", "datetime", "nested"]
+}
+```
+
+`Decimal` is numeric and `Boolean` is not (in R, `is.numeric(TRUE)` is
+`FALSE` too). `Enum` is not `categorical`: use `cs.enum()`. `temporal`
+includes `Duration` and `Time`. `cs.datetime()` matches naive and tz-aware
+columns; narrow it with `time_zone=None` or `time_zone="*"` (any zone).
+
+**Previewing.** `cs.expand_selector()` resolves a selector against a
+`DataFrame`, a `LazyFrame` or a schema and returns the names, computing
+nothing; `strict=False` also accepts `pl.col()` / `pl.all()` roots:
+
+```{python}
+(
+    cs.expand_selector(flights_df.lazy(), cs.integer() - cs.by_name("year", "month", "day")),
+    cs.expand_selector(penguins_df.schema, pl.col("^bill_.*$"), strict=False),
+)
+```
+
+### Set algebra {#sec-sel-algebra}
+
+| Polars | Meaning | tidyselect |
+|---|---|---|
+| `a | b` | union | `a | b`, `c(a, b)` |
+| `a & b` | intersection | `a & b` |
+| `a - b` | difference | `a & !b` |
+| `a ^ b` | in exactly one | — |
+| `~a` | complement (`cs.all() - a`) | `!a` |
+
+: Selector set operators {.striped}
+
+```{python}
+(
+    cs.expand_selector(flights_df, cs.ends_with("_time") - cs.starts_with("sched")),
+    cs.expand_selector(penguins_df, cs.by_name("year", "species")),
+    cs.expand_selector(penguins_df, cs.by_name("year") | cs.by_name("species")),
+)
+```
+
+**Order rule.** A single `by_name()` / `by_index()` keeps the order you
+wrote; any set operation returns **frame order**. So does
+`pl.col("year", "^bill_.*$")`, because a pattern among the names makes it a
+union. For a chosen order, pass separate arguments:
+`select("year", cs.all() - cs.by_name("year"))`.
+
+### Selector or expression? {#sec-sel-dispatch}
+
+`Selector` subclasses `Expr`, so `-`, `&`, `|`, `^` and `~` each mean two
+things. Python decides from the operand types:
+
+| Expression | Result | Meaning |
+|---|---|---|
+| `selector - selector` (also `&`, `|`, `^`), `~selector` | `Selector` | set operation |
+| `selector + selector`, `*`, `/`, `>`, `==` …; `selector - pl.col("x")`, `- "x"`, `- 1` | `Expr` | arithmetic / comparison |
+| `selector | pl.col("x")` | `Expr` | **bitwise** or (logical on Booleans) |
+| `pl.col("x") - selector`, `1 - selector` | `TypeError` | use `selector.as_expr()` |
+| `selector.mean()`, `selector.name.suffix(...)`, any method | `Expr` | no more set algebra |
+
+: Operator dispatch, verified on Polars 2.0 {.striped}
+
+```{python}
+#| error: true
+penguins_df.select(1 - cs.float())
+```
+
+`.as_expr()` turns a selector into a plain expression
+(`expr.meta.as_selector()` goes back). `.name.keep()` is needed below because
+`1 - x` is named `literal`, its leftmost input:
+
+```{python}
+penguins_df.head(2).select((1 - cs.float().as_expr()).name.keep())
+```
+
+### `across()`: functions over many columns {#sec-sel-across}
+
+One function is a method call on the selector: `cs.ends_with("_mm").round(1)`
+≈ `across(ends_with("_mm"), \(x) round(x, 1))`. **Your own function** is a
+Python function from `Expr` to `Expr`, the `\(x) ...` of `across()`. Pass it
+the selector and everything inside expands:
+
+```{python}
+def scale(e: pl.Expr) -> pl.Expr:
+    """as.numeric(scale(x)): centre, then divide by the SD."""
+    return (e - e.mean()) / e.std()
+
+penguins_df.select(scale(cs.ends_with("_mm"))).head(2)
+```
+
+`e - e.mean()` is selector minus expression: arithmetic, zipped column by
+column. **Several functions** are a list of expressions, each with its own
+suffix:
+
+```{python}
+mm_stats = [
+    cs.ends_with("_mm").mean().name.suffix("_mean"),
+    cs.ends_with("_mm").std().name.suffix("_sd"),
+]
+penguins_df.group_by("species", maintain_order=True).agg(mm_stats)
+```
+
+The columns come out **function-major** (all means, then all SDs); dplyr
+gives column-major (`bill_length_mm_mean`, `bill_length_mm_sd`, …). If order
+matters, loop over the names yourself:
+
+```{python}
+fns = {"mean": pl.Expr.mean, "sd": pl.Expr.std}   # ≈ list(mean = mean, sd = sd)
+mm_cols = cs.expand_selector(penguins_df, cs.ends_with("_mm"))
+
+penguins_df.select(
+    fn(pl.col(c)).alias(f"{c}_{fn_name}") for c in mm_cols for fn_name, fn in fns.items()
+).columns
+```
+
+| `across(.names = )` | Polars, chained after the computation |
+|---|---|
+| `"{.col}"` (default, one function) | nothing: each output keeps its input's name |
+| `"{.col}_{.fn}"` / `"{.fn}_{.col}"` | `.name.suffix("_mean")` / `.name.prefix("mean_")` |
+| `"{toupper(.col)}"` | `.name.to_uppercase()`, `.name.to_lowercase()` |
+| `"{str_remove(.col, '_mm')}"` | `.name.replace("_mm$", "")` (regex; `literal=True`), `.name.strip_suffix("_mm")` |
+| any function of the name | `.name.map(lambda c: ...)` |
+| (back to the root column's name) | `.name.keep()` |
+
+: `.names` glue specs → the `.name` namespace {.striped}
+
+`.name.suffix()`, `.prefix()` and `.map()` act on the **current** output
+name: after `.alias("z")` they give `z_…`, although the docstring says "root
+column name". Only `.name.keep()` returns to the root.
+
+**Selectors skip the group keys.** Inside `group_by().agg()`, a selector or
+`pl.all()` leaves out the grouping columns, like `across()` in a grouped
+`summarise()`. `year` is numeric but not aggregated:
+
+```{python}
+penguins_df.group_by("year").agg(cs.numeric().mean()).sort("year")
+```
+
+An explicit `pl.col("year").first()` still collides with the key
+(`DuplicateError`).
+
+### Row-wise: the `*_horizontal` family {#sec-sel-rowwise}
+
+Expression methods work **down** a column. Row-wise work goes **across**
+columns, through `pl.*` functions that take many expressions (a selector
+counts as many) and return one value per row:
+
+| tidyverse | Polars |
+|---|---|
+| `rowSums(pick(...), na.rm = TRUE)` / `rowMeans(...)` | `pl.sum_horizontal(...)` / `pl.mean_horizontal(...)` |
+| `pmin()` / `pmax()` | `pl.min_horizontal()` / `pl.max_horizontal()` |
+| `if_all(cols, fn)` / `if_any(cols, fn)` | `pl.all_horizontal(fn(sel))` / `pl.any_horizontal(fn(sel))` |
+| `str_c(a, b, sep = "-")` / `unite()` | `pl.concat_str(a, b, separator="-")` |
+| `rowwise()` + `f(c_across(cols))` | `pl.concat_list(sel).list.f()` |
+| `pick(a, b)` as one value per row | `pl.struct(a, b)` |
+
+: Row-wise equivalents {.striped}
+
+```{python}
+nulls_df = pl.DataFrame({"a": [1, None, None], "b": [10, 20, None]})
+nulls_df.with_columns(
+    sum=pl.sum_horizontal("a", "b"),
+    sum_strict=pl.sum_horizontal("a", "b", ignore_nulls=False),
+    mean=pl.mean_horizontal("a", "b"),
+    max=pl.max_horizontal("a", "b"),
+    plus=pl.col("a") + pl.col("b"),
+    str=pl.concat_str("a", "b", separator="-"),
+)
+```
+
+- `sum`, `mean`, `min`, `max` skip nulls by default, i.e. `na.rm = TRUE`
+  (R's default is `FALSE`); `ignore_nulls=False` on `sum` / `mean` gives R's
+  default. An all-null row sums to **0** (as `rowSums(na.rm = TRUE)` does);
+  its mean is null (R: `NaN`).
+- `+` and `concat_str()` propagate nulls, like `str_c()`;
+  `concat_str(..., ignore_nulls=True)` skips them, like `unite(na.rm = TRUE)`.
+- `all_horizontal()` / `any_horizontal()` use the three-valued logic of `&` /
+  `|`: `any(null, true)` is `true`, `any(null, false)` is null.
+
+**`if_any()` / `if_all()`.** A multi-output predicate in `filter()` is
+refused, not silently combined:
+
+```{python}
+#| error: true
+flights_df.filter(cs.ends_with("_delay") > 60)
+```
+
+Say which reduction you mean. The comparison is a value, so keep it in a
+variable:
+
+```{python}
+very_late = cs.ends_with("_delay") > 60          # dep_delay, arr_delay
+
+flights_df.select(
+    any_late=pl.any_horizontal(very_late),
+    all_late=pl.all_horizontal(very_late),
+).select(pl.all().sum(), pl.all().null_count().name.suffix("_null"))
+```
+
+The 9,178 nulls are flights with a missing delay and no other delay over 60.
+`filter()` drops them, as `filter(if_any(...))` drops `NA`.
+
+**`c_across()`.** For statistics without a `_horizontal` version (median, SD,
+non-null count), pack the row into a list and use the `list` namespace. Mixed
+`Int64` / `Float64` inputs are cast to their supertype:
+
+```{python}
+mm_row = pl.concat_list(cs.ends_with("_mm"))
+
+penguins_df.slice(2, 3).select(
+    cs.ends_with("_mm"),
+    mm_median=mm_row.list.median(),
+    mm_n=mm_row.list.drop_nulls().list.len(),
+)
+```
+
+A struct packs a row into one value without changing dtypes, which is what
+counting or deduplicating combinations needs (≈ `n_distinct(species, island)`):
+
+```{python}
+penguins_df.select(n_combos=pl.struct("species", "island").n_unique())
+```
+
+`pl.struct(...).map_elements(f)` hands each row to Python as a `dict`: the
+`rowwise()` escape hatch, and just as slow.
+
+## Where it bites {#sec-sel-gotchas}
+
+| tidyverse | Polars |
+|---|---|
+| `where(is.numeric) & !year` is always a selection | `cs.numeric() - pl.col("year")` is **subtraction** |
+| `.names` gives each output its own name | `.alias()` gives every output the same name |
+| output names come from `.names` | from the **leftmost** input, even with the selector on the right |
+| a bad `matches()` pattern matches nothing | an unanchored `pl.col()` string is a literal name; in `pl.exclude()` it is ignored |
+| `where(is.POSIXct)` finds every date-time | `pl.col(pl.Datetime("us"))` misses tz-aware columns |
+| `filter(across())` is deprecated | `filter(<multi-output>)` raises |
+
+: The differences at a glance {.striped}
+
+### Selector minus a column is arithmetic {#sec-sel-arith-trap}
+
+```{python}
+penguins_df.head(2).select(cs.numeric() - pl.col("year"))
+```
+
+The intent was "numeric except `year`". The result subtracts 2007 from every
+numeric column (`year - year = 0`), with no warning. `cs.integer() |
+pl.col("year")` is worse: a bitwise OR of integers. **Rule:** set operations
+need a selector on **both** sides: `cs.numeric() - cs.by_name("year")`
+(raises on a typo) or `cs.numeric().exclude("year")` (ignores one).
+
+### Names after expansion {#sec-sel-name-trap}
+
+`.alias()` gives every expanded expression the same name:
+
+```{python}
+#| error: true
+penguins_df.select(cs.ends_with("_mm").mean().alias("mm_mean"))
+```
+
+The same code works whenever the selector happens to match one column, so it
+breaks only when the data changes. Use `.name.suffix()` / `.name.map()`.
+With the selector on the right, every output takes the left operand's name:
+
+```{python}
+#| error: true
+penguins_df.select(pl.col("body_mass_g") / cs.ends_with("_mm"))
+```
+
+`.name.keep()` doesn't help (the root is still `body_mass_g`): put the
+selector on the left, or loop over `cs.expand_selector()` with `.alias()`.
+The `*_horizontal` functions follow the same rule, which in `with_columns()`
+means a silent overwrite: here `bill_length_mm` is replaced by the sum.
+
+```{python}
+penguins_df.head(2).with_columns(
+    pl.sum_horizontal("bill_length_mm", "bill_depth_mm")
+).select(cs.starts_with("bill"))
+```
+
+Always name a horizontal result: `bill_total=pl.sum_horizontal(...)`.
+
+### Patterns that aren't patterns {#sec-sel-regex-trap}
+
+```{python}
+#| error: true
+penguins_df.select(pl.col("^bill"))          # no trailing $ → a literal column name
+```
+
+`pl.exclude()` is `by_name(require_all=False)` underneath, so the same
+mistake, or a typo, excludes nothing and raises nothing:
+
+```{python}
+penguins_df.select(pl.exclude("^bill", "yaer")).columns
+```
+
+`df.drop("yaer")` and `cs.all() - cs.by_name("yaer")` do raise. Literal
+selectors overmatch too: on `flights`, `cs.contains("time")` also picks up
+`time_hour`; `cs.ends_with("_time")` does not.
+
+### Dtype instances match exactly {#sec-sel-dtype-trap}
+
+`flights.time_hour` is `Datetime("us", "America/New_York")`:
+
+```{python}
+(
+    flights_df.select(pl.col(pl.Datetime("us"))).columns,   # means time_zone=None
+    flights_df.select(pl.col(pl.Datetime)).columns,         # any unit, any zone
+    cs.expand_selector(flights_df, cs.datetime("us")),       # any zone by default
+)
+```
+
+The first selects nothing, silently. Prefer the `cs.*` dtype selectors: they
+ignore the parameters you don't name.
+
+## Recipes {#sec-sel-recipes}
+
+**Standardize every numeric column within groups**
+(≈ `mutate(across(where(is.numeric) & !year, \(x) as.numeric(scale(x)), .names = "{.col}_z"), .by = species)`):
+
+```{python}
+penguins_df.with_columns(
+    scale(cs.numeric() - cs.by_name("year")).over("species").name.suffix("_z")
+).select("species", cs.ends_with("_z")).head(3)
+```
+
+**Many columns × many statistics as a tidy table.** Reshape first, then
+summarise one `value` column, so there are no names to parse afterwards
+(≈ `pivot_longer()` then `summarise(.by = c(species, measure))`).
+`unpivot()` casts the mixed `Int64` / `Float64` inputs to one `Float64`
+column:
+
+```{python}
+(
+    penguins_df
+    .unpivot(on=cs.numeric() - cs.by_name("year"), index="species", variable_name="measure")
+    .group_by("species", "measure", maintain_order=True)
+    .agg(
+        n=pl.col("value").count(),          # non-null count
+        mean=pl.col("value").mean(),
+        sd=pl.col("value").std(),
+    )
+    .head(5)
+)
+```
+
+**`where()` with a predicate on values.** Selectors can't see data, so
+compute the predicate, then pass the names
+(≈ `select(where(\(x) any(is.na(x))))`):
+
+```{python}
+has_null = flights_df.select(pl.all().is_null().any()).row(0, named=True)
+flights_df.select([name for name, flag in has_null.items() if flag]).columns
+```
+
+**Rename a subset** (≈ `rename_with(\(x) str_remove(x, "_mm"), ends_with("_mm"))`).
+`with_columns(cs.ends_with("_mm").name.strip_suffix("_mm"))` adds renamed
+*copies* and keeps the originals. Build a mapping instead:
+
+```{python}
+penguins_df.rename(
+    {c: c.removesuffix("_mm") for c in cs.expand_selector(penguins_df, cs.ends_with("_mm"))}
+).columns
+```
+
+## See also {#sec-sel-see-also}
+
+- Cheatsheet:
+  [Select Columns](../overview/polars-cheatsheet.qmd#sec-cs-select) ·
+  [Create & Modify Columns](../overview/polars-cheatsheet.qmd#sec-cs-mutate) (`across()`) ·
+  [Filter Rows](../overview/polars-cheatsheet.qmd#sec-cs-filter) (`if_any()` / `if_all()`) ·
+  [Programming with Polars](../overview/polars-cheatsheet.qmd#sec-cs-programming)
+- Related: [Expressions & Contexts](expressions.qmd) ·
+  [Data Model & Dtypes](data-model.qmd) ·
+  [Grouping & Aggregation](../transform/group-agg.qmd) ·
+  [Window Functions](../transform/window.qmd) ·
+  [Reshaping](../transform/reshape.qmd) (`unpivot()`) ·
+  [Missing Values](../types/missing.qmd) (null semantics)
+- Polars user guide:
+  [Expression expansion](https://docs.pola.rs/user-guide/expressions/expression-expansion/)
+- Python API: [Selectors](https://docs.pola.rs/api/python/stable/reference/selectors.html) ·
+  [`Expr.name`](https://docs.pola.rs/api/python/stable/reference/expressions/name.html)
+- R: `?tidyselect::language`; dplyr `vignette("colwise")` and `vignette("rowwise")`

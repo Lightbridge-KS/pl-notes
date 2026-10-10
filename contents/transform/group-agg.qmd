@@ -1,0 +1,557 @@
+---
+title: "Grouping & Aggregation"
+subtitle: "≈ `group_by()` + `summarise()` · `.by` · `reframe()` · `count()`"
+jupyter: python3
+---
+
+`group_by().agg()` is the context from
+[Expressions & Contexts](../core/expressions.qmd#sec-expr-contexts) where every
+expression runs once per group: a length-1 result becomes a value, anything
+longer becomes a list. This chapter builds on that rule: how keys are formed,
+the order groups come out in, which count counts what, how to pick one value
+per group, how to return several rows per group, and the `GroupBy` methods
+that skip `agg()`.
+
+## In tidyverse {#sec-grp-tidyverse}
+
+From R4DS 2e, [Groups](https://r4ds.hadley.nz/data-transform.html#groups):
+
+```r
+library(dplyr)
+library(nycflights13)
+
+flights |>
+  group_by(month) |>
+  summarize(avg_delay = mean(dep_delay, na.rm = TRUE), n = n())
+
+flights |>
+  summarize(delay = mean(dep_delay, na.rm = TRUE), n = n(), .by = c(origin, dest))
+
+flights |> group_by(year, month, day) |> summarize(n = n())   # message: grouped by year, month
+```
+
+dplyr groups in two ways. `group_by()` returns a **grouped tibble**: the
+grouping persists, keys come out sorted, each `summarise()` peels off the last
+key (the `.groups` message), and you finish with `ungroup()`. `.by` groups for
+one verb only: keys come out in order of first appearance, and the result is
+never grouped.
+
+Polars has only the second kind. `group_by()` returns a `GroupBy` object that
+the next call consumes, and the result is a plain `DataFrame`: no grouped
+state, no `ungroup()`, no `.groups`.
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import polars as pl
+from pl_notes import datasets
+
+flights_df = datasets.flights()
+penguins_df = datasets.penguins()
+
+flights_df.group_by("month").agg(
+    avg_delay=pl.col("dep_delay").mean(),   # skips nulls: na.rm = TRUE is the default
+    n=pl.len(),
+).sort("month").head(3)
+```
+
+Same numbers as R4DS (10.0 minutes over 27,004 flights in January). Without
+`.sort("month")` the months come out in arbitrary order (@sec-grp-order).
+
+## Mental model {#sec-grp-model}
+
+```text
+ flights_df.group_by("month")      a GroupBy: the frame + the keys, nothing computed yet
+     ├── .agg(e1, e2, …)           one row per group; each expression runs on each group
+     ├── .len()  .mean()  …        shortcut: one operation on every non-key column
+     ├── .head(n)  .tail(n)        n whole rows per group
+     ├── .having(predicate)        drop whole groups (SQL HAVING); still a GroupBy
+     ├── .map_groups(fn)           a Python fn(sub_df) per group, results stacked
+     └── for key, sub_df in …      iterate; key is always a tuple
+
+ Inside .agg(): split → apply → combine
+ ┌─────────────┐    pl.col("dep_delay").mean() → 10.04       scalar
+ │ month = 1   │──► pl.len()                   → 27004       scalar  ──► one row:
+ │ 27,004 rows │    pl.col("dep_delay")        → [2, 4, …]   list        1 │ 10.04 │ 27004 │ [2, 4, …]
+ └─────────────┘    … and the same for month = 2, 3, …
+```
+
+A `GroupBy` holds only the frame and the keys (`.by`, `.maintain_order`).
+`.agg()` runs `df.lazy().group_by(...).agg(...).collect()`, so eager grouping
+goes through the same query engine as lazy code.
+
+| dplyr | Polars |
+|---|---|
+| `group_by(g)`: a grouped tibble that persists | `group_by("g")`: a `GroupBy`, used by the next call only |
+| `summarise()` drops one key (`.groups`); `ungroup()` | `agg()` returns a plain `DataFrame`; nothing to undo |
+| keys sorted (`group_by()`) or in first-appearance order (`.by`) | arbitrary; `.sort()` or `maintain_order=True` |
+| `group_by(g) |> filter(n() > k) |> summarise(...)` | `group_by("g").having(pl.len() > k).agg(...)` |
+| grouped `mutate()` / `filter()` | `expr.over("g")`, see [Window Functions](window.qmd) |
+
+: Grouping, side by side {.striped}
+
+## Mechanics {#sec-grp-mechanics}
+
+### Keys {#sec-grp-keys}
+
+Several keys go in as positional arguments, a list, or a selector
+(≈ `.by = c(origin, dest)`):
+
+```{python}
+flights_df.group_by("origin", "dest", maintain_order=True).agg(
+    delay=pl.col("dep_delay").mean(), n=pl.len()
+).head(3)
+```
+
+A key can be an expression. A positional one keeps the name of its leftmost
+input (@sec-expr-naming), so this key is called `sched_dep_time` but holds
+hours:
+
+```{python}
+flights_df.group_by(pl.col("sched_dep_time") // 100).agg(pl.len()).sort("sched_dep_time").head(2)
+```
+
+Name computed keys with a keyword argument instead, e.g.
+`group_by(date=pl.col("time_hour").dt.date())` for R4DS's
+`group_by(year, month, day)`. Keyword keys come after the positional ones.
+Calendar buckets work the same way (`dt.truncate("1w")`); sliding and dynamic
+time windows (`group_by_dynamic()`, `rolling()`) belong to
+[Dates, Times & Durations](../types/datetime.qmd).
+
+A null key forms its own group, as in dplyr, and `sort()` puts it first
+(`penguins_df.group_by("sex").len().sort("sex")` gives null 11, female 165,
+male 168). Groups come only from rows that exist: an unused `Enum` level gets
+no row, and there is no `.drop = FALSE` (join onto the levels instead, see
+[Reshaping](reshape.qmd)). `agg()` with no expressions returns the distinct key
+combinations (≈ `distinct(species, island)`). Inside `agg()`, `pl.all()` means
+every **non-key** column, so `agg(pl.all().first())` does not duplicate the key.
+
+### Output order and `maintain_order=` {#sec-grp-order}
+
+Groups are built by hashing the keys in parallel, so the default output order
+is arbitrary and changes between runs (two identical `group_by("dest")` calls
+on `flights` returned different orders). dplyr's two orders each have a Polars
+spelling:
+
+```{python}
+dest_df_first_seen = flights_df.group_by("dest", maintain_order=True).agg(n=pl.len())  # ≈ .by
+dest_df_sorted = flights_df.group_by("dest").agg(n=pl.len()).sort("dest")           # ≈ group_by()
+dest_df_first_seen["dest"].head(4).to_list(), dest_df_sorted["dest"].head(4).to_list()
+```
+
+`maintain_order=True` means **first appearance**, not sorted. In the streaming
+engine's plan it adds a row index before the group-by and a sort of the
+*groups* by their first row after it: one sort over 105 groups, not 336,776
+rows, which cost a few percent on `flights`. (The docstring says it blocks the
+streaming engine; on 2.0.0 the streaming engine ran it natively.)
+
+Within a group, rows always keep their input order, whatever
+`maintain_order` says. That is what makes `first()`, `last()` and `head()`
+meaningful: sort the frame, then group.
+
+```{python}
+flights_df.with_row_index("row").group_by("dest").agg(
+    in_input_order=(pl.col("row").diff() > 0).all()
+).select(pl.col("in_input_order").all())
+```
+
+### Counting {#sec-grp-count}
+
+| R | Polars | Nulls |
+|---|---|---|
+| `n()` | `pl.len()` | rows, nulls included |
+| `sum(!is.na(x))` | `pl.col("x").count()` | **excluded** |
+| `sum(is.na(x))` | `pl.col("x").null_count()` | only nulls |
+| `n_distinct(x)` | `pl.col("x").n_unique()` | null counts as one value |
+| `n_distinct(x, na.rm = TRUE)` | `pl.col("x").drop_nulls().n_unique()` | excluded |
+| `sum(x > 0, na.rm = TRUE)` | `(pl.col("x") > 0).sum()` | null comparisons skipped |
+
+: Which count counts what {.striped}
+
+Cancelled flights have a null `dep_time`, and a few have no `tailnum`:
+
+```{python}
+flights_df.group_by("month").agg(
+    n=pl.len(),
+    n_departed=pl.col("dep_time").count(),
+    n_cancelled=pl.col("dep_time").null_count(),
+    n_planes=pl.col("tailnum").n_unique(),
+    n_planes_known=pl.col("tailnum").drop_nulls().n_unique(),
+).sort("month").head(3)
+```
+
+Every count is `UInt32` ([Counts are unsigned](../core/data-model.qmd#sec-dm-unsigned)),
+including the sum of a Boolean (@sec-grp-unsigned).
+
+The rest of the `count()` family, beyond the cheatsheet's rows
+([Summarise & Group](../overview/polars-cheatsheet.qmd#sec-cs-summarise)):
+
+| dplyr | Polars |
+|---|---|
+| `tally()` | `df.select(n=pl.len())`, or `df.height` |
+| `count(g, wt = x)` | `df.group_by("g").agg(n=pl.col("x").sum())` |
+| `count(g, name = "k")` | `df.group_by("g").len(name="k")` |
+| `count(g) |> mutate(prop = n / sum(n))` | `df["g"].value_counts(normalize=True)`: column `proportion` |
+| `summarise(across(everything(), \(x) sum(!is.na(x))))` | `df.count()` |
+
+: The `count()` family; `value_counts()` on an expression returns a struct (@sec-grp-reframe) {.striped}
+
+### Picking one value per group {#sec-grp-pick}
+
+Beyond the cheatsheet's `first()` / `last()` / `get()`:
+
+| dplyr | Polars | Note |
+|---|---|---|
+| `first(x, na_rm = TRUE)` | `.first(ignore_nulls=True)` | also `last()` and the `GroupBy` shortcuts |
+| `nth(x, -1)` | `.get(-1)` | negative counts from the end |
+| `nth(x, 100)` past the end → `NA` | `.get(99, null_on_oob=True)` | without it, out of range is an error |
+| `x[which.max(y)]` | `pl.col("x").get(pl.col("y").arg_max())` | |
+| assert one value | `.item()` | error unless exactly one; `allow_empty=True` → null |
+
+: Picking values {.striped}
+
+`pl.nth(1)` is not `nth(x, 2)`: it selects the second *column* of the frame.
+
+**The value of `x` at the maximum of `y`** has four spellings, and they
+differ on nulls:
+
+```{python}
+toy_df = pl.DataFrame({"g": ["a", "a", "a", "b"], "x": ["p", "q", "r", "s"], "y": [3, None, 5, None]})
+
+toy_df.group_by("g", maintain_order=True).agg(
+    sort_last=pl.col("x").sort_by("y").last(),
+    sort_desc_first=pl.col("x").sort_by("y", descending=True).first(),   # trap
+    sort_desc_nl=pl.col("x").sort_by("y", descending=True, nulls_last=True).first(),
+    at_arg_max=pl.col("x").get(pl.col("y").arg_max()),
+    top_k_by=pl.col("x").top_k_by("y", 1).first(),
+)
+```
+
+- `sort_by()` puts nulls first, like `sort()`. Sorting descending and taking
+  `first()` returns the null row (`q`). Use `nulls_last=True`, or ascending +
+  `last()`.
+- `arg_max()` ignores nulls, so an all-null group gives null (`b`). The
+  others return the null row.
+- `top_k_by("y", k)` returns *k* values, a list inside `agg()` until
+  `.first()` makes it a scalar.
+- **Ties:** none of them picks a defined row. `sort_by()` is unstable unless
+  `maintain_order=True`, and the docs of `arg_max()` and `top_k_by()` say a
+  tie is broken arbitrarily. To keep every tied row, see @sec-grp-recipes.
+
+A multi-column expression takes several columns from the same row: on
+`flights`, `pl.col("carrier", "flight", "dest").top_k_by("arr_delay", 1).first()`
+per `origin` returns the worst-delayed flight's carrier, number and
+destination.
+
+### Conditional aggregation {#sec-grp-conditional}
+
+A `.filter()` inside one expression affects only that expression: `late_avg`
+sees late flights only, while `n` sees all of them. A frame-level `filter()`
+before grouping would change every column.
+
+```{python}
+flights_df.group_by("carrier").agg(
+    n=pl.len(),
+    prop_late=(pl.col("arr_delay") > 0).mean(),                          # nulls skipped
+    late_avg=pl.col("arr_delay").filter(pl.col("arr_delay") > 0).mean(),
+    n_very_late=(pl.col("arr_delay") > 120).sum(),
+).sort("prop_late", descending=True).head(3)
+```
+
+When the filter leaves a group empty:
+
+```{python}
+x_kept = pl.col("x").filter(pl.col("x") > 2)
+pl.DataFrame({"g": ["a", "b"], "x": [1, 3]}).group_by("g", maintain_order=True).agg(
+    mean=x_kept.mean(), sum=x_kept.sum(), count=x_kept.count(), max=x_kept.max()
+)
+```
+
+On an empty vector R gives `mean()` → `NaN`, `sum()` → `0`, and `max()` →
+`-Inf` with a warning. Polars gives null, 0, 0, null.
+
+To drop whole groups, use `having()`, SQL's `HAVING`: its predicates are
+aggregations evaluated per group and combined with `&`.
+
+```{python}
+flights_df.group_by("dest").having(pl.len() > 15000).agg(
+    n=pl.len(), delay=pl.col("arr_delay").mean()
+).sort("dest")
+```
+
+That is `group_by(dest) |> filter(n() > 15000) |> summarise(...)`. To keep the
+*rows* of the big groups instead, use `filter(pl.len().over("dest") > 15000)`
+([Window Functions](window.qmd)).
+
+### Quantiles and medians {#sec-grp-quantiles}
+
+```{python}
+pl.DataFrame({"x": [1.0, 2.0, 3.0, 4.0]}).select(
+    median=pl.col("x").median(),
+    q25=pl.col("x").quantile(0.25),                              # default "nearest"
+    q25_linear=pl.col("x").quantile(0.25, interpolation="linear"),
+)
+```
+
+`median()` matches R. `quantile()` does not: R's default (type 7) is linear
+interpolation, `quantile(1:4, 0.25)` = 1.75, while Polars defaults to
+`"nearest"`. Pass `interpolation="linear"` to match R. The other methods are
+`"higher"`, `"lower"`, `"midpoint"` and `"equiprobable"`.
+
+A list of probabilities works in `select()` but not in `agg()` or `over()`.
+The workaround, one scalar quantile per probability packed into a list, is in
+the next section.
+
+```{python}
+#| error: true
+penguins_df.group_by("species").agg(pl.col("body_mass_g").quantile([0.25, 0.5, 0.75]))
+```
+
+### Several rows per group: `reframe()` {#sec-grp-reframe}
+
+```r
+penguins |>
+  reframe(
+    prob = c(0.25, 0.5, 0.75),
+    mass = quantile(body_mass_g, c(0.25, 0.5, 0.75), na.rm = TRUE),
+    .by = species
+  )
+```
+
+`agg()` stores a multi-value result as a list, and `explode()` turns lists
+into rows, so `reframe()` ≈ `agg()` + `explode()`:
+
+```{python}
+probs = [0.25, 0.5, 0.75]
+
+penguins_df.group_by("species", maintain_order=True).agg(
+    prob=pl.lit(probs),
+    mass=pl.concat_list(
+        [pl.col("body_mass_g").quantile(p, interpolation="linear") for p in probs]
+    ),
+).explode("prob", "mass")
+```
+
+Exploding several columns together requires equal list lengths in each row
+(`ShapeError` otherwise), the same rule `reframe()` enforces. Without groups,
+`select()` with equal-length outputs is already `reframe()`
+(@sec-expr-contexts).
+
+Some expressions return several *columns* at once, as a struct.
+`value_counts()` returns one struct per distinct value, so inside `agg()` you
+get a list of structs: explode to rows, then unnest to columns.
+
+```{python}
+penguins_df.group_by("species", maintain_order=True).agg(
+    pl.col("island").value_counts(sort=True)
+).explode("island").unnest("island")
+```
+
+### Shortcuts on `GroupBy` {#sec-grp-shortcuts}
+
+| Method | Same as | Note |
+|---|---|---|
+| `.len(name="n")` | `.agg(n=pl.len())` | `GroupBy.count()` was removed in 2.0 |
+| `.first()`, `.last()` | `.agg(pl.all().first())` | `ignore_nulls=` |
+| `.sum()`, `.mean()`, `.median()`, `.min()`, `.max()`, `.n_unique()` | `.agg(pl.all().mean())`, … | every non-key column |
+| `.quantile(q)` | `.agg(pl.all().quantile(q))` | `"nearest"` by default |
+| `.all()` | `.agg(pl.all())` | every column as a list |
+| `.head(n)`, `.tail(n)` | `slice_head(n =)`, `slice_tail(n =)` | rows, not lists; `n=5` by default |
+| `.having(...)` | | returns a `GroupBy` |
+| `.map_groups(fn)` | `group_modify()` | Python per group (@sec-grp-escape) |
+
+: `GroupBy` methods in 2.0 (no `std()`, `var()` or `count()`: use `agg()`) {.striped}
+
+A shortcut applies to every non-key column, whatever its dtype. `mean()` of a
+string column is null, with no warning:
+
+```{python}
+penguins_df.group_by("species", maintain_order=True).mean()
+```
+
+And the dplyr name is gone, with an error that points to the new one:
+
+```{python}
+#| error: true
+penguins_df.group_by("species").count()
+```
+
+### Escape hatches: split, iterate, apply {#sec-grp-escape}
+
+`partition_by()` ≈ `group_split()`. With `as_dict=True` the keys are tuples,
+even for one key column. Unlike `group_by()`, it keeps first-appearance order
+by default, and it takes column names or selectors, not expressions (add a
+derived key with `with_columns()` first):
+
+```{python}
+penguins_by_species = penguins_df.partition_by("species", as_dict=True)
+list(penguins_by_species), penguins_by_species[("Gentoo",)].shape
+```
+
+Iterating over a `GroupBy` yields `(key_tuple, sub_df)` pairs:
+
+```{python}
+for (species,), species_df in penguins_df.group_by("species", maintain_order=True):
+    print(f"{species:<10} {species_df.height:>4} rows")
+```
+
+`map_groups(fn)` calls a Python function on each sub-frame and stacks the
+returned frames, like `group_modify()`. It is the last resort: Python per
+group, no parallelism, no query optimization.
+
+```{python}
+import numpy as np
+
+def fit_slope(species_df: pl.DataFrame) -> pl.DataFrame:
+    """Least-squares slope of body mass on flipper length (g per mm)."""
+    complete_df = species_df.drop_nulls(["flipper_length_mm", "body_mass_g"])
+    slope, _ = np.polyfit(complete_df["flipper_length_mm"], complete_df["body_mass_g"], 1)
+    return pl.DataFrame({"species": complete_df["species"][:1], "slope": [slope]})
+
+penguins_df.group_by("species", maintain_order=True).map_groups(fit_slope)
+```
+
+Most such functions have a native form. The slope is cov(x, y) / var(x):
+
+```{python}
+penguins_df.drop_nulls(["flipper_length_mm", "body_mass_g"]).group_by(
+    "species", maintain_order=True
+).agg(slope=pl.cov("flipper_length_mm", "body_mass_g") / pl.col("flipper_length_mm").var())
+```
+
+## Where it bites {#sec-grp-gotchas}
+
+| tidyverse behaviour | Polars behaviour |
+|---|---|
+| `group_by()` output is sorted by key | arbitrary order: `.sort()` or `maintain_order=True` |
+| `count()` counts rows per group | `count()` counts **non-null** values; rows per group is `len()` |
+| an unaggregated column in `summarise()` warns | it silently becomes a list column |
+| `n()` and `sum(x > 0)` are signed | `UInt32`: differences wrap around |
+| `nth(x, 2)` | `pl.nth(1)` is the second column; use `.get(1)` |
+| `quantile()` interpolates (type 7) | `"nearest"` by default; a list of probabilities fails in `agg()` |
+| `slice_max()` keeps ties | `top_k_by()`, `arg_max()` and unstable sorts pick one tied row arbitrarily |
+| `.drop = FALSE` keeps empty factor levels | empty groups never appear, even for an `Enum` |
+| `group_split()` returns a list | iteration and `partition_by(as_dict=True)` keys are tuples |
+
+: The differences at a glance {.striped}
+
+`count` never means dplyr's `count()`: `Expr.count()` counts non-null values,
+`DataFrame.count()` does that for every column (`penguins_df.count()` gives
+342 for `body_mass_g`, not 344), and `GroupBy.count()` is gone
+(@sec-grp-shortcuts).
+
+### Forgetting to aggregate gives a list column {#sec-grp-list-trap}
+
+The list-or-scalar decision is **static**: it comes from the expression, not
+from the data. `head(1)` changes length, so it yields a list even though every
+list holds one value. `first()` aggregates, so it yields a scalar:
+
+```{python}
+penguins_df.group_by("species").agg(
+    head_1=pl.col("body_mass_g").head(1), first=pl.col("body_mass_g").first()
+).schema
+```
+
+A forgotten aggregation does not fail where you made it. Arithmetic on a list
+column works element-wise, so the error surfaces later, at a comparison:
+
+```{python}
+#| error: true
+delays_df = flights_df.group_by("dest").agg(delay=pl.col("arr_delay"))   # forgot .mean()
+delays_df.with_columns(pl.col("delay") / 60).filter(pl.col("delay") > 1)
+```
+
+Check `.schema` after an `agg()`: an unexpected `list[...]` is a missing
+aggregation.
+
+### Boolean counts are unsigned {#sec-grp-unsigned}
+
+The sum of a Boolean is a count, so it is `UInt32` too, and subtracting a
+larger count wraps around. Cast to `Int64` before subtracting (more in
+[Counts are unsigned](../core/data-model.qmd#sec-dm-unsigned)):
+
+```{python}
+flights_df.group_by("origin").agg(
+    n_late=(pl.col("dep_delay") > 0).sum(), n_early=(pl.col("dep_delay") < 0).sum()
+).with_columns(late_minus_early=pl.col("n_late") - pl.col("n_early")).sort("origin")
+```
+
+## Recipes {#sec-grp-recipes}
+
+**Proportion within a group**
+(≈ `count(origin, carrier) |> mutate(prop = n / sum(n), .by = origin)`):
+
+```{python}
+flights_df.group_by("origin", "carrier").len(name="n").with_columns(
+    prop=pl.col("n") / pl.col("n").sum().over("origin")
+).sort("origin", "n", descending=[False, True]).head(3)
+```
+
+`pl.col("carrier").value_counts(sort=True, normalize=True)` inside `agg()`
+gives the same proportions in one step.
+
+**Top row per group, with or without ties** (≈ `slice_max()`). R4DS runs
+`flights |> group_by(dest) |> slice_max(arr_delay, n = 1)` and gets 108 rows
+for 105 destinations:
+
+```{python}
+worst_df_ties = flights_df.filter(pl.col("arr_delay") == pl.col("arr_delay").max().over("dest"))
+worst_df_head = (
+    flights_df.sort("arr_delay", descending=True, nulls_last=True).group_by("dest").head(1)
+)
+worst_df_topk = (
+    flights_df.group_by("dest").agg(pl.all().top_k_by("arr_delay", 1)).explode(pl.exclude("dest"))
+)
+{
+    "filter == max().over()   (ties kept)": worst_df_ties.height,
+    "sort + group_by().head(1)": worst_df_head.height,
+    "agg(top_k_by) + explode": worst_df_topk.height,
+}
+```
+
+These counts account for R4DS's 108. 104 destinations have a maximum and three
+of them (CHS, ILM, RSW) have a tie, which gives 107 rows. The 108th is LGA's
+only flight, whose `arr_delay` is null: `slice_max()` keeps it, while the
+`filter()` drops it because `null == null` is null. The other two methods
+return one row per destination, LGA included, and break ties arbitrarily. For
+the top *n* by rank, use `rank().over()` ([Window Functions](window.qmd)).
+
+**Random rows per group** (≈ `slice_sample(n = 2)`): shuffle once with a seed,
+then take the head of each group, which keeps the shuffled order:
+`df.sample(fraction=1, shuffle=True, seed=42).group_by("g").head(2)`.
+
+**Collapse a group's values into one string**
+(≈ `paste(sort(unique(carrier)), collapse = ", ")`):
+
+```{python}
+with pl.Config(fmt_str_lengths=60):   # show the full strings
+    print(flights_df.group_by("origin").agg(
+        n_carriers=pl.col("carrier").n_unique(),
+        carriers=pl.col("carrier").unique().sort().str.join(", "),
+    ).sort("origin"))
+```
+
+`str.join()` aggregates, so the result is a scalar. It skips nulls
+(`ignore_nulls=True`), whereas R's `paste()` writes `"NA"`; with
+`ignore_nulls=False`, any null makes the result null.
+
+## See also {#sec-grp-see-also}
+
+- Cheatsheet:
+  [Summarise & Group](../overview/polars-cheatsheet.qmd#sec-cs-summarise) ·
+  [Window & Ranking Functions](../overview/polars-cheatsheet.qmd#sec-cs-window) ·
+  [List Columns & Structs](../overview/polars-cheatsheet.qmd#sec-cs-nested)
+- Before: [Expressions & Contexts](../core/expressions.qmd) (the `agg()`
+  context and the list rule) · [Data Model & Dtypes](../core/data-model.qmd)
+  (unsigned counts)
+- Next: [Window Functions](window.qmd) (grouped `mutate()` / `filter()`, ranks) ·
+  [Reshaping](reshape.qmd) (`explode()`, `unnest()`, `complete()`) ·
+  [Missing Values](../types/missing.qmd) ·
+  [Dates, Times & Durations](../types/datetime.qmd) (`group_by_dynamic()`)
+- Polars user guide: [Aggregation](https://docs.pola.rs/user-guide/expressions/aggregation/)
+- Python API: [GroupBy](https://docs.pola.rs/api/python/stable/reference/dataframe/group_by.html)
+- R side: R4DS 2e, [Groups](https://r4ds.hadley.nz/data-transform.html#groups);
+  dplyr `?dplyr_by` (`.by` vs `group_by()`)

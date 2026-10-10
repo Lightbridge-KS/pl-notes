@@ -1,0 +1,525 @@
+---
+title: "Expressions & Contexts"
+subtitle: "≈ data masking · tidy eval: the engine under every dplyr verb"
+jupyter: python3
+---
+
+Every Polars verb is a **context** that runs **expressions**. Once that pair
+is clear, the rest of Polars is vocabulary. This chapter covers what an
+expression is, the length rules each context enforces, where output names come
+from, and the places where tidyverse intuition gives the wrong answer.
+
+## In tidyverse {#sec-expr-tidyverse}
+
+```r
+library(dplyr)
+library(palmerpenguins)
+
+penguins |>
+  mutate(
+    bill_ratio = bill_length_mm / bill_depth_mm,
+    heavy      = body_mass_g > mean(body_mass_g, na.rm = TRUE)
+  )
+```
+
+dplyr does two things here without showing you:
+
+1. **Capture.** `bill_length_mm / bill_depth_mm` is not evaluated when R reads
+   it. `mutate()` captures the code unevaluated (*data masking*; the captured
+   object is a *quosure*).
+2. **Evaluate.** `mutate()` then runs that code with the columns of
+   `penguins` in scope and attaches the result.
+
+Polars splits these two steps into two things you can see and hold: the
+**expression** (step 1) and the **context** (step 2).
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import polars as pl
+from pl_notes import datasets
+
+penguins_df = datasets.penguins()   # the same 344 × 8 table as palmerpenguins
+
+penguins_df.with_columns(
+    bill_ratio=pl.col("bill_length_mm") / pl.col("bill_depth_mm"),
+    heavy=pl.col("body_mass_g") > pl.col("body_mass_g").mean(),
+).select("species", "bill_ratio", "heavy").head(3)
+```
+
+`.mean()` skips nulls, so `na.rm = TRUE` is already the default.
+
+## Mental model {#sec-expr-model}
+
+```text
+ BUILD (plain Python, touches no data)       RUN (a context)
+ ─────────────────────────────────────       ──────────────────────────────────────────────
+ bill_ratio = (                              penguins_df.with_columns(bill_ratio=bill_ratio)
+     pl.col("bill_length_mm")      ───────►  penguins_df.filter(bill_ratio > 2.5)
+     / pl.col("bill_depth_mm")               penguins_df.group_by("species").agg(bill_ratio.mean())
+ )
+ # a pl.Expr: a recipe, not a result         The context decides
+                                               • which rows the expression sees  (whole frame / one group)
+                                               • which output lengths are legal  (n, 1, or anything)
+                                               • what the result becomes         (columns, row mask, row per group)
+```
+
+An expression is a function from a frame to a column (`DataFrame → Series`)
+that has not been called yet. The context is the caller.
+
+|  | tidyverse | Polars |
+|---|---|---|
+| Unevaluated column code | captured implicitly (a quosure) | built explicitly: a `pl.Expr` object |
+| How it is built | non-standard evaluation captures what you typed | operator overloading: `pl.col("a") / pl.col("b")` calls `Expr.__truediv__`, which returns a bigger tree, not a number |
+| Evaluated by | the verb (`mutate`, `filter`, …) | the context (`with_columns`, `filter`, …) |
+| Stored and reused with | `quo()` + `!!` or `{{ }}` | an ordinary Python variable |
+
+: Same idea, different mechanism {.striped}
+
+## Mechanics {#sec-expr-mechanics}
+
+### Expressions are values {#sec-expr-values}
+
+Build an expression without any frame in sight:
+
+```{python}
+bill_ratio = pl.col("bill_length_mm") / pl.col("bill_depth_mm")
+print(type(bill_ratio))
+print(bill_ratio)
+```
+
+Nothing was computed. It is a tree that names its inputs, and you can inspect
+it:
+
+```{python}
+bill_ratio.meta.root_names(), bill_ratio.meta.output_name()
+```
+
+Remember that output name for later (@sec-expr-naming). The same
+expression can now run in any context:
+
+```{python}
+penguins_df.filter(bill_ratio > 3.5).select("species", "island", "bill_length_mm")
+```
+
+```{python}
+penguins_df.group_by("species", maintain_order=True).agg(bill_ratio.mean())  # column name: see Naming
+```
+
+The R equivalent needs explicit quoting and unquoting:
+
+```r
+bill_ratio <- quo(bill_length_mm / bill_depth_mm)   # capture
+penguins |> filter(!!bill_ratio > 3.5)              # inject
+```
+
+In Polars, an expression is already a value: you can keep it in a variable,
+put it in a list, or return it from a function, all with no special syntax.
+The same expression also works unchanged on a `LazyFrame` (`penguins_df.lazy()`).
+
+### Three output shapes {#sec-expr-shapes}
+
+Every expression maps an input of *n* rows to an output of some length. The
+context then checks whether that length is allowed.
+
+```text
+ n rows ──► element-wise     ──► n rows    + - * /, abs(), round(), str.*, dt.*,
+                                           fill_null(), is_null(), shift(), cum_sum(), rank()
+ n rows ──► aggregation      ──► 1 row     mean(), sum(), max(), len(), n_unique(), first()
+ n rows ──► length-changing  ──► k rows    filter(), drop_nulls(), unique(), head(k)
+```
+
+dplyr has the same three kinds (`x + 1`, `mean(x)`, `x[x > 0]`), and
+`mutate()` enforces the same rule: an output must be size *n* or size 1.
+Polars enforces a version of that rule in every context except `agg()`:
+outputs must share one length, or have length 1 and be broadcast. `agg()`
+accepts any length.
+
+### The contexts {#sec-expr-contexts}
+
+| Context | dplyr | Each expression must return | Result |
+|---|---|---|---|
+| `select()` | `transmute()`, ungrouped `summarise()` / `reframe()` | one shared length *k*, or 1 (broadcast) | a new frame of *k* rows |
+| `with_columns()` | `mutate()` | *n* (the frame height) or 1 (broadcast) | the input plus new or replaced columns |
+| `filter()` | `filter()` | Boolean, length *n* or 1 | the rows where the condition is `true` |
+| `group_by().agg()` | `summarise()` / `reframe()` | anything: length 1 → a scalar, otherwise → a **list** | one row per group |
+| `expr.over(g)` | grouped `mutate()` | group size, or 1 (broadcast within the group) | *n* rows, aligned to the input |
+
+: The four contexts, plus the window {.striped}
+
+#### `select()`: a new frame from expressions
+
+A length-1 result is broadcast to match the others:
+
+```{python}
+penguins_df.select(
+    pl.col("body_mass_g"),
+    avg_mass=pl.col("body_mass_g").mean(),   # 1 value → repeated 344 times
+).head(3)
+```
+
+All expressions of length *k* is fine. This is dplyr's `reframe()`:
+
+```{python}
+penguins_df.select(pl.col("species").unique(maintain_order=True))
+```
+
+Mixing two different lengths is an error, not a recycle:
+
+```{python}
+#| error: true
+penguins_df.select(pl.col("species"), pl.col("body_mass_g").drop_nulls())
+```
+
+#### `with_columns()`: add or replace columns
+
+The same rules apply with *k* fixed at the frame height. A length-342
+`drop_nulls()` here fails with "can't broadcast Series … of length 342 to
+length 344".
+
+```{python}
+penguins_df.with_columns(
+    bill_ratio=bill_ratio,
+    mass_vs_avg=pl.col("body_mass_g") - pl.col("body_mass_g").mean(),
+).select("species", "bill_ratio", "mass_vs_avg").head(3)
+```
+
+#### `filter()`: keep rows where the condition is true
+
+An aggregation inside the condition is broadcast, as in
+`filter(body_mass_g > mean(body_mass_g))`. Comma-separated conditions are
+combined with AND:
+
+```{python}
+penguins_df.filter(
+    pl.col("body_mass_g") > pl.col("body_mass_g").mean(),
+    pl.col("island") == "Dream",
+).select("species", "island", "body_mass_g")
+```
+
+#### `group_by().agg()`: one row per group
+
+`agg()` is the one context that never complains about length. If a result
+has more than one row, `agg()` turns it into a **list**:
+
+```{python}
+penguins_df.group_by("species", maintain_order=True).agg(
+    n=pl.len(),                                     # 1 per group → scalar
+    avg_mass=pl.col("body_mass_g").mean(),          # 1 per group → scalar
+    masses=pl.col("body_mass_g"),                   # n per group → list
+    top3=pl.col("body_mass_g").drop_nulls().sort(descending=True).head(3),  # 3 → list
+)
+```
+
+In dplyr ≥ 1.1, `masses = body_mass_g` inside `summarise()` gives a
+deprecation warning and returns several rows per group, which is now
+`reframe()`'s job. Polars keeps one row per group and stores the values as a
+list column, like `summarise(masses = list(body_mass_g))`.
+
+::: {.callout-tip}
+`sort()`, `filter()` and `head()` are applied to a single column here, inside
+each group. That is exactly what `agg()` is for. The same calls inside
+`select()` can silently misalign rows (@sec-expr-sort-trap).
+:::
+
+#### `expr.over(g)`: the window, i.e. grouped `mutate()`
+
+`.over()` is a method on the expression, not the frame: the expression
+carries its own grouping, and you run it inside `select()` or
+`with_columns()`. An aggregation is broadcast back to the group's rows, and an
+element-wise expression is computed separately within each group:
+
+```{python}
+penguins_df.select(
+    "species",
+    "body_mass_g",
+    species_avg=pl.col("body_mass_g").mean().over("species"),
+    rank_in_species=pl.col("body_mass_g").rank("dense", descending=True).over("species"),
+).head(4)
+```
+
+The [Window Functions](../transform/window.qmd) chapter covers `order_by=`
+and `mapping_strategy=`.
+
+#### Expressions in other arguments
+
+Many verb arguments besides the four contexts also accept expressions. Group by
+a computed key (≈ `count(heavy = body_mass_g > 4200)`):
+
+```{python}
+penguins_df.group_by(heavy=pl.col("body_mass_g") > 4200).agg(pl.len()).sort("heavy")
+```
+
+Sort by a computed value (≈ `arrange(str_length(species), body_mass_g)`):
+
+```{python}
+penguins_df.sort(
+    pl.col("species").str.len_chars(), "body_mass_g", nulls_last=True
+).select("species", "body_mass_g").head(3)
+```
+
+`join(left_on=..., right_on=...)` accepts expressions too.
+
+### Naming: where output names come from {#sec-expr-naming}
+
+dplyr names an unnamed output after its code (`mean(x)`). Polars uses these
+rules instead:
+
+1. The output name is the name of the **leftmost input** of the expression:
+   `pl.col("a") / pl.col("b")` → `a`, and `pl.col("a").mean()` → `a`.
+2. An expression that starts without a column gets a fixed name:
+   `pl.lit(...)` → `literal` and `pl.len()` → `len`.
+3. `pl.when(...).then(...)` takes its name from the first `then()`.
+4. Override the name with a keyword argument (`name=expr`) or `.alias("name")`.
+   Bulk renames use `.name.suffix()` and similar (see
+   [Selectors](selectors.qmd)).
+5. Names must be unique within one context.
+
+```{python}
+penguins_df.select(
+    pl.col("bill_length_mm") / pl.col("bill_depth_mm"),   # → bill_length_mm (!)
+    pl.lit(1) + pl.col("year"),                            # → literal
+    pl.len(),                                              # → len, broadcast
+).head(2)
+```
+
+Rule 1 plus rule 5 means a summary that works in dplyr fails in Polars:
+
+```{python}
+#| error: true
+# summarise(mean(body_mass_g), max(body_mass_g)) works in dplyr
+penguins_df.select(pl.col("body_mass_g").mean(), pl.col("body_mass_g").max())
+```
+
+Name them:
+
+```{python}
+penguins_df.select(
+    mass_mean=pl.col("body_mass_g").mean(),
+    mass_max=pl.col("body_mass_g").max(),
+)
+```
+
+::: {.callout-note}
+## Keyword arguments come last
+
+Python puts positional arguments before keyword arguments, so in
+`select(pl.col("a"), b=...)` the keyword-named columns always come out last.
+If a computed column needs to come first, name it with `.alias()` and pass it
+positionally.
+:::
+
+### When is a string a column? {#sec-expr-literals}
+
+In R, a bare name is a column and a quoted string is a value. In Polars both
+are strings, so Polars decides from **where** the string appears:
+
+| Where the string appears | Read as | Example |
+|---|---|---|
+| Verb arguments that name columns | column | `select("x")`, `sort("x")`, `group_by("g")`, `drop("x")` |
+| Inputs to expression functions | **column** | `.then("big")`, `.otherwise(...)`, `pl.coalesce("a", "b")`, `pl.concat_str("a", "b")` |
+| The right-hand side of an operator | value | `pl.col("species") == "Gentoo"` |
+| Parameters that take a value | value | `fill_null("unknown")`, `is_in(["Dream"])`, `str.contains("^B")` |
+| Wrapped in `pl.lit()` | value | `pl.lit("big")` |
+
+: String interpretation by position {.striped}
+
+```{python}
+#| error: true
+penguins_df.select(pl.coalesce("sex", "unknown"))      # looks for a column "unknown"
+```
+
+```{python}
+penguins_df.select(pl.coalesce("sex", pl.lit("unknown"))).unique(maintain_order=True)
+```
+
+::: {.callout-tip}
+## Rule of thumb
+
+If a string is meant as data, wrap it in `pl.lit()`. That is never wrong.
+:::
+
+### Parallel, not sequential {#sec-expr-parallel}
+
+All expressions in one context read the **input frame**, independently and in
+parallel. The overview shows the loud version of this: a new column cannot
+be referenced in the same call. The quiet version is worse. If you replace a
+column and then read it in the same call, you get the **old** values:
+
+```r
+tibble(a = 1:2) |> mutate(a = a * 10, b = a + 1)   # b = 11, 21 (sees the new a)
+```
+
+```{python}
+pl.DataFrame({"a": [1, 2]}).with_columns(
+    pl.col("a") * 10,
+    b=pl.col("a") + 1,          # reads the ORIGINAL a → 2, 3
+)
+```
+
+```text
+dplyr  mutate():       a = a * 10  ──►  b = a + 1       sequential: each sees the previous
+Polars with_columns(): input ──┬──►  a * 10             parallel: each sees the input
+                               └──►  a + 1
+```
+
+To get dplyr's behaviour, either chain a second `.with_columns()`, or, if the
+intermediate value is only a step toward the result, keep it in a Python
+variable:
+
+```{python}
+mass_kg = pl.col("body_mass_g") / 1000
+
+penguins_df.select(
+    "species",
+    mass_kg=mass_kg,
+    mass_kg_sq=mass_kg**2,
+).head(3)
+```
+
+`mass_kg` appears twice in the query, but the lazy optimizer computes it only
+once (common-subexpression elimination). In the plan below,
+`__POLARS_CSER_…` is the shared subexpression, computed once in
+`WITH_COLUMNS` and read twice (more in the [Lazy API](../scale/lazy.qmd)
+chapter):
+
+```{python}
+print(
+    penguins_df.lazy()
+    .select("species", mass_kg=mass_kg, mass_kg_sq=mass_kg**2)
+    .explain()
+)
+```
+
+## Where it bites {#sec-expr-gotchas}
+
+| tidyverse behaviour | Polars behaviour |
+|---|---|
+| bare names are captured implicitly | `pl.col()` builds an explicit `Expr` |
+| `mutate()` arguments run in order | expressions in one context run in parallel on the input |
+| `summarise()` expects size 1 (more rows → `reframe()`) | `agg()` keeps one row per group and wraps longer results in a list |
+| an unnamed output is named after its code (`mean(x)`) | named after its leftmost input (`x`), so duplicates raise an error |
+| a quoted string is a value | a string is usually a column name; use `pl.lit()` |
+| `arrange()` reorders whole rows | `.sort()` on an expression reorders only that column |
+
+: The differences at a glance {.striped}
+
+### `sort()` on an expression breaks row alignment {#sec-expr-sort-trap}
+
+```{python}
+penguins_df.select(
+    "species",
+    pl.col("body_mass_g").sort(descending=True, nulls_last=True),
+).head(3)
+```
+
+The three heaviest penguins are Gentoos, yet these rows say Adelie. The output
+has the right length, so nothing raised an error: the masses were sorted and
+the species were not. `.unique()`, `.filter()` and `.drop_nulls()` cause the
+same misalignment when they happen to produce matching lengths (for example,
+two `.unique()` columns of 3 values each); otherwise they raise a `ShapeError`.
+
+**Rule:** to reorder or remove *rows*, use frame verbs (`df.sort()`,
+`df.filter()`, `df.unique()`). Use expression-level `sort` / `filter` /
+`unique` inside `agg()`, or on a column you select on its own.
+
+```{python}
+penguins_df.sort("body_mass_g", descending=True, nulls_last=True).select(
+    "species", "body_mass_g"
+).head(3)
+```
+
+### Python's `and`, `or`, `not`, `in`, `is`
+
+These Python keywords can't be overridden for expressions. Each one asks an
+expression for a single `True`/`False`, which an expression can't provide:
+
+```{python}
+#| error: true
+penguins_df.filter(3000 < pl.col("body_mass_g") < 4000)   # = (3000 < x) and (x < 4000)
+```
+
+`is None` is worse, because it does not raise an error. `is` checks Python
+object identity before Polars sees anything, so `pl.col("sex") is None`
+evaluates to plain `False`, and `filter(False)` keeps no rows:
+
+```{python}
+penguins_df.filter(pl.col("sex") is None).height   # 0, silently wrong
+```
+
+```{python}
+penguins_df.filter(pl.col("sex").is_null()).height   # 11
+```
+
+`pl.col("sex") == None` is not right either: comparing with null gives null,
+so it also keeps 0 rows (Polars at least warns).
+
+| R | Python habit (wrong) | Polars |
+|---|---|---|
+| `x > 1 & x < 5` | `1 < x < 5`, `... and ...` | `(x > 1) & (x < 5)` or `x.is_between(1, 5)` |
+| `x | y` | `x or y` | `x | y` |
+| `!x` | `not x` | `~x` |
+| `is.na(x)` | `x is None`, `x == None` | `x.is_null()` |
+| `x %in% c("a", "b")` | `x in ["a", "b"]` | `x.is_in(["a", "b"])` |
+
+: Here `x` means an expression such as `pl.col("x")` {.striped}
+
+## Recipes {#sec-expr-recipes}
+
+**Share of total and deviation from the group mean** (aggregations
+broadcast inside `with_columns()`):
+
+```{python}
+penguins_df.with_columns(
+    mass_share=pl.col("body_mass_g") / pl.col("body_mass_g").sum(),
+    mass_vs_species=pl.col("body_mass_g") - pl.col("body_mass_g").mean().over("species"),
+).select("species", "body_mass_g", "mass_share", "mass_vs_species").head(3)
+```
+
+**Conditional aggregation** (≈ `mean(body_mass_g[sex == "female"])`):
+
+```{python}
+penguins_df.group_by("species", maintain_order=True).agg(
+    female_mass=pl.col("body_mass_g").filter(pl.col("sex") == "female").mean(),
+    male_mass=pl.col("body_mass_g").filter(pl.col("sex") == "male").mean(),
+)
+```
+
+**Extract a single value** (≈ `pull()` on a one-cell summary):
+
+```{python}
+penguins_df.select(pl.col("body_mass_g").mean()).item()
+```
+
+**Build expressions in a loop** (≈ `across()` over a vector of names). Every
+context accepts a list of expressions:
+
+```{python}
+measures = ["bill_length_mm", "bill_depth_mm", "flipper_length_mm"]
+
+penguins_df.group_by("species", maintain_order=True).agg(
+    [pl.col(m).mean().alias(f"{m}_mean") for m in measures]
+)
+```
+
+[Selectors](selectors.qmd) does the same thing without a loop. Functions that
+*return* expressions (the Polars version of `{{ }}`) are in the cheatsheet's
+[Programming with Polars](../overview/polars-cheatsheet.qmd#sec-cs-programming).
+
+## See also {#sec-expr-see-also}
+
+- Cheatsheet:
+  [Conventions](../overview/polars-cheatsheet.qmd#sec-cs-conventions) ·
+  [Create & Modify Columns](../overview/polars-cheatsheet.qmd#sec-cs-mutate) ·
+  [Summarise & Group](../overview/polars-cheatsheet.qmd#sec-cs-summarise) ·
+  [Gotchas at a Glance](../overview/polars-cheatsheet.qmd#sec-cs-gotchas)
+- Next: [Selectors & Expression Expansion](selectors.qmd) ·
+  [Grouping & Aggregation](../transform/group-agg.qmd) ·
+  [Window Functions](../transform/window.qmd)
+- Polars user guide: [Expressions and contexts](https://docs.pola.rs/user-guide/concepts/expressions-and-contexts/)
+- Python API: [Expressions reference](https://docs.pola.rs/api/python/stable/reference/expressions/index.html)
+- dplyr: `vignette("programming", package = "dplyr")`, the data-masking side of
+  this chapter
