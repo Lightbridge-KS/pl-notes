@@ -1,0 +1,4 @@
+- source: project
+  netlify:
+    - id: efb7de2f-fa22-4141-a164-c8183d618e49
+      url: https://magnificent-lolly-432534.netlify.app
