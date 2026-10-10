@@ -1,0 +1,25 @@
+project:
+  type: book
+
+book:
+  title: "Polar Notes"
+  author: "Kittipos Sirivongrungson"
+  date: today
+  repo-url: https://github.com/Lightbridge-KS/pl-notes
+  site-url: https://pl-notes-lightbridge.netlify.app
+  chapters:
+    - index.qmd
+
+format:
+  html:
+    theme:
+      light:
+        - theme/warm-light.scss
+      dark:
+        - theme/warm-dark.scss
+    toc-depth: 4
+    highlight-style:
+      light: theme/atom-one-light-warm.theme
+      dark: theme/atom-one-dark-warm.theme
+
+freeze: auto

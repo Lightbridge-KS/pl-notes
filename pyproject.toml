@@ -1,0 +1,18 @@
+[project]
+name = "pl-notes"
+version = "0.1.0"
+description = "Note about Polar"
+readme = "README.md"
+authors = [
+    { name = "Lightbridge-KS", email = "ki11ip0.s.a.s@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "ipykernel>=7.4.0",
+    "polar>=0.0.127",
+]
+
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"

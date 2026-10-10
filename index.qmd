@@ -1,0 +1,5 @@
+# Preface {.unnumbered}
+
+::: {.callout-note appearance="default" collapse="false"}
+Notes on Polar.
+:::
