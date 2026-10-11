@@ -496,13 +496,13 @@ Combine freely: "1h30m", "2w", "3mo"
 
 | forcats / base R | Polars | Note |
 |---|---|---|
-| `factor(y)` | `pl.col("y").cast(pl.Categorical)` | levels inferred |
+| `factor(y)` | `pl.col("y").cast(pl.Categorical)` | open set; sorts by string, not level order |
 | `factor(y, levels = c("lo", "mid", "hi"))` | `pl.col("y").cast(pl.Enum(["lo", "mid", "hi"]))` | fixed order; sorting follows it |
 | `levels(f)` (Enum) | `df.schema["y"].categories` | |
 | distinct values of a factor | `df.select(pl.col("y").unique())` | `cat.get_categories()` removed in 2.0 |
-| `as.integer(f)` | `pl.col("y").to_physical()` | 0-based codes |
+| `as.integer(f)` | `pl.col("y").to_physical()` | 0-based; stable for Enum only |
 | `fct_recode(f, A = "a")` | `pl.col("y").replace({"a": "A"})` | then re-cast if needed |
-| `cut(x, c(-Inf, 40, 47, Inf), labels = ...)` | `pl.col("x").bin_intervals([40, 47], labels=["s", "m", "l"])` | replaces `cut()` in 2.0 |
+| `cut(x, c(-Inf, 40, 47, Inf), labels = ...)` | `pl.col("x").bin_intervals([40, 47], labels=["s", "m", "l"], right_closed=True)` | `right_closed=True` matches `cut()`; default is left-closed |
 | `ntile(x, 4)` | `pl.col("x").bin_ranks(4, labels=False) + 1` | `bin_ranks` is 0-based |
 | quantile-based bins | `pl.col("x").bin_quantiles(4, labels=False)` | replaces `qcut()` in 2.0 |
 

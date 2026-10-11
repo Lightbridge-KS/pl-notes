@@ -392,7 +392,7 @@ holds only 11:00 and 13:00.
 
 Beyond the built-ins, `pl.col("x").sum().rolling("t", period="3h")` runs *any*
 expression over a time window, and `df.rolling()` / `df.group_by_dynamic()`
-are the frame-level versions. All three need a sorted index (@sec-win-sorted).
+are the frame-level versions ([Time-Series Operations](../types/timeseries.qmd)). All three need a sorted index (@sec-win-sorted).
 Exponentially weighted windows are `ewm_mean()`, `ewm_std()` and `ewm_var()`.
 
 ## Where it bites {#sec-win-gotchas}

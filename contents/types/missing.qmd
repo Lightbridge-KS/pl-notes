@@ -479,7 +479,7 @@ case dplyr gives the same count, since `planes` has no `NA` key to match.
 **Empty groups** are implicit missing rows too. `group_by()` on an `Enum`
 returns only the levels that occur (there is no `.drop = FALSE`); to keep the
 others, left-join the summary onto a frame of all levels, built from
-`dtype.categories`.
+`dtype.categories` ([recipe](categorical.qmd#sec-cat-recipes)).
 
 ## Where it bites {#sec-na-gotchas}
 

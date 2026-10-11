@@ -119,13 +119,13 @@ Name computed keys with a keyword argument instead, e.g.
 `group_by(year, month, day)`. Keyword keys come after the positional ones.
 Calendar buckets work the same way (`dt.truncate("1w")`); sliding and dynamic
 time windows (`group_by_dynamic()`, `rolling()`) belong to
-[Dates, Times & Durations](../types/datetime.qmd).
+[Time-Series Operations](../types/timeseries.qmd).
 
 A null key forms its own group, as in dplyr, and `sort()` puts it first
 (`penguins_df.group_by("sex").len().sort("sex")` gives null 11, female 165,
 male 168). Groups come only from rows that exist: an unused `Enum` level gets
 no row, and there is no `.drop = FALSE` (join onto the levels instead, see
-[Reshaping](reshape.qmd)). `agg()` with no expressions returns the distinct key
+[Categorical & Enum](../types/categorical.qmd#sec-cat-recipes)). `agg()` with no expressions returns the distinct key
 combinations (≈ `distinct(species, island)`). Inside `agg()`, `pl.all()` means
 every **non-key** column, so `agg(pl.all().first())` does not duplicate the key.
 
@@ -550,7 +550,7 @@ with pl.Config(fmt_str_lengths=60):   # show the full strings
 - Next: [Window Functions](window.qmd) (grouped `mutate()` / `filter()`, ranks) ·
   [Reshaping](reshape.qmd) (`explode()`, `unnest()`, `complete()`) ·
   [Missing Values](../types/missing.qmd) ·
-  [Dates, Times & Durations](../types/datetime.qmd) (`group_by_dynamic()`)
+  [Time-Series Operations](../types/timeseries.qmd) (`group_by_dynamic()`)
 - Polars user guide: [Aggregation](https://docs.pola.rs/user-guide/expressions/aggregation/)
 - Python API: [GroupBy](https://docs.pola.rs/api/python/stable/reference/dataframe/group_by.html)
 - R side: R4DS 2e, [Groups](https://r4ds.hadley.nz/data-transform.html#groups);

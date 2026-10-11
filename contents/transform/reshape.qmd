@@ -620,7 +620,7 @@ plus one null already in the data (explicit missing). The range is
 time-zone aware, so 3 November has both 01:00 EDT and 01:00 EST. For a
 single time column, `weather_df.sort("origin", "time_hour").upsample(
 "time_hour", every="1h", group_by="origin")` builds the same grid in one call
-(it needs sorted input).
+(it needs sorted input; see [Time-Series](../types/timeseries.qmd#sec-ts-resample)).
 
 ## See also {#sec-rs-see-also}
 
@@ -628,7 +628,8 @@ single time column, `weather_df.sort("origin", "time_hour").upsample(
   [Reshape](../overview/polars-cheatsheet.qmd#sec-cs-reshape) ·
   [List Columns & Structs](../overview/polars-cheatsheet.qmd#sec-cs-nested) ·
   [Strings](../overview/polars-cheatsheet.qmd#sec-cs-strings)
-- Related: [Missing Values](../types/missing.qmd) (implicit vs explicit) ·
+- Related: [Strings & Regex](../types/strings.qmd) ·
+  [Missing Values](../types/missing.qmd) (implicit vs explicit) ·
   [Joins & Concatenation](joins.qmd) (cross, anti, `maintain_order=`) ·
   [Grouping & Aggregation](group-agg.qmd) (`pivot()` is a `group_by()`) ·
   [Data Model & Dtypes](../core/data-model.qmd) (supertypes)

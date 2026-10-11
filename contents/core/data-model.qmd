@@ -173,6 +173,7 @@ new frame costs almost nothing.
 | list-column | `List(inner)` | every element shares **one** inner dtype |
 | — | `Array(inner, shape)` | fixed-length list |
 | data-frame column | `Struct({name: dtype, ...})` | named fields |
+| named list per row | `Map(key, value)` | key → value pairs; new in 2.0 ([Nested Data](../types/nested.qmd)) |
 | an all-`NA` vector | `Null` | the dtype of a column with no values |
 
 : R types → Polars dtypes {.striped}
@@ -411,7 +412,8 @@ pl.DataFrame({"dose": [1, 2.5]}, schema={"dose": pl.Float64})
 ```
 
 (`[1.0, 2]` works, because the first value sets the dtype to `Float64` and
-`2` fits it.) Row-binding behaves the same way:
+`2` fits it.) Nested lists are the exception: `pl.Series([[1, 2], [3.7]])` becomes
+`List(Int64)` and silently truncates `3.7` to `3`. Row-binding behaves the same way:
 
 ```{python}
 #| error: true

@@ -436,8 +436,8 @@ weather_df.filter(pl.col("origin") == "JFK").group_by(
 ```
 
 `group_by_dynamic()` (overlapping or offset calendar windows) and `rolling()`
-belong to a later time-series chapter; time-based `rolling_*_by()` is in
-[Window Functions](../transform/window.qmd).
+are in [Time-Series Operations](timeseries.qmd); time-based `rolling_*_by()` is
+in [Window Functions](../transform/window.qmd).
 
 ## Where it bites {#sec-dt-gotchas}
 
