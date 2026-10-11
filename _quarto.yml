@@ -35,6 +35,9 @@ book:
       chapters:
         - contents/scale/lazy.qmd
 
+filters:
+  - diagram-zoom
+
 format:
   html:
     theme:
