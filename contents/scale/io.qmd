@@ -1,0 +1,744 @@
+---
+title: "Reading & Writing Data"
+subtitle: "≈ readr · readxl · arrow · DBI"
+jupyter: python3
+---
+
+Import is where silent damage happens: a column typed wrong, a missing marker
+read as text, a Thai name decoded as noise. This chapter covers which formats
+remember dtypes, how CSV inference fails, Thai legacy encodings, Parquet and
+IPC as the bridge to R, Excel, SQLite, and folders of files. Lazy scans,
+pushdown and hive partitions are in [Lazy API](lazy.qmd#sec-lazy-sources);
+one-line translations are in the
+[cheatsheet](../overview/polars-cheatsheet.qmd#sec-cs-io).
+
+## In tidyverse {#sec-io-tidyverse}
+
+```r
+library(tidyverse); library(readxl); library(arrow); library(DBI)
+
+weather <- read_csv("weather.csv")          # "NA" missing, dates parsed
+problems(weather)                           # what failed to parse
+ris <- read_csv("ris_export.csv", col_types = cols(hn = col_character()),
+                locale = locale(encoding = "TIS-620", tz = "Asia/Bangkok"))
+
+read_excel("exams.xlsx", sheet = "CT", skip = 2)
+write_parquet(exams, "exams.parquet"); read_feather("exams.arrow")
+
+con <- dbConnect(RSQLite::SQLite(), "ris.sqlite")
+dbGetQuery(con, "SELECT * FROM exams WHERE hn = ?", params = list("0012345"))
+dbWriteTable(con, "exams", exams)
+
+read_csv(files, id = "path")                # many files, one frame
+```
+
+readr is generous: R4DS 2e describes it guessing each column from 1,000 rows
+spaced evenly through the file, reading `""` and `"NA"` as missing, parsing
+dates, and logging failures for `problems()`. Polars' CSV reader is literal:
+it guesses from the **first 100 rows**, `"NA"` is a string, dates stay
+strings, and a value that doesn't fit the guess is an error.
+
+## Mental model {#sec-io-model}
+
+```text
+              EAGER: a DataFrame now              LAZY: a plan (Lazy API chapter)
+ ───────────  ─────────────────────────────────   ─────────────────────────────────
+ read         pl.read_csv     pl.read_parquet      pl.scan_csv     pl.scan_parquet
+              pl.read_ipc     pl.read_ndjson       pl.scan_ipc     pl.scan_ndjson
+              pl.read_excel   pl.read_database     (none: Excel and SQL are eager only)
+ write        df.write_csv    df.write_parquet     lf.sink_csv     lf.sink_parquet
+              df.write_ipc    df.write_ndjson      lf.sink_ipc     lf.sink_ndjson
+              df.write_excel  df.write_database
+
+ What a file remembers about dtypes
+   Parquet, IPC   the whole Polars schema ──► read back exactly
+   NDJSON         numbers, booleans, lists, structs; the rest becomes text
+   Excel          numbers, booleans, dates; the rest becomes text
+   CSV            nothing: every value is text, re-guessed on every read
+```
+
+The working rule: **CSV and Excel are for exchange, Parquet is for
+storage.** Parse a CSV carefully once, then keep the typed result as Parquet.
+
+## Mechanics {#sec-io-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+Every file below goes into a temporary directory deleted at the end.
+
+```{python}
+import datetime as dt
+import importlib.util
+import io
+import sqlite3
+import tempfile
+from functools import partial
+from pathlib import Path
+
+import polars as pl
+import xlsxwriter
+from pl_notes import datasets
+
+tmp = tempfile.TemporaryDirectory()
+data_dir = Path(tmp.name)
+```
+
+### Which formats keep dtypes {#sec-io-dtypes}
+
+An invented exam log with the dtypes that usually go wrong:
+
+```{python}
+exams_df = pl.DataFrame({
+    "hn": ["0012345", "0098765", "0012345"],
+    "modality": ["CT", "MR", "XR"],
+    "arrived": [dt.datetime(2024, 1, 15, 8, 30), dt.datetime(2024, 1, 15, 9, 5),
+                dt.datetime(2024, 1, 16, 14, 0)],
+    "exam_date": [dt.date(2024, 1, 15), dt.date(2024, 1, 15), dt.date(2024, 1, 16)],
+    "tat_min": [35.5, None, 12.0],
+    "n_images": [120, 300, 2],
+    "cost": ["1500.50", "8200.00", "350.00"],
+    "findings": [["nodule"], [], ["fracture", "effusion"]],
+}).with_columns(
+    pl.col("modality").cast(pl.Enum(["XR", "CT", "MR"])),
+    pl.col("arrived").dt.replace_time_zone("Asia/Bangkok"),
+    pl.col("n_images").cast(pl.UInt16),
+    pl.col("cost").cast(pl.Decimal(10, 2)),
+)
+exams_df
+```
+
+Write each column to each format, read it back, and record the dtype that
+came back (`✓` = unchanged):
+
+```{python}
+formats = {
+    "parquet": (pl.DataFrame.write_parquet, pl.read_parquet),
+    "ipc": (pl.DataFrame.write_ipc, pl.read_ipc),
+    "csv": (pl.DataFrame.write_csv, pl.read_csv),
+    "ndjson": (pl.DataFrame.write_ndjson, pl.read_ndjson),
+    "xlsx": (pl.DataFrame.write_excel, pl.read_excel),
+}
+
+
+def roundtrip(column: str, fmt: str) -> str:
+    write, read = formats[fmt]
+    path = data_dir / f"roundtrip.{fmt}"
+    try:
+        write(exams_df.select(column), path)
+    except Exception as err:
+        return f"✗ {type(err).__name__}"
+    dtype = read(path).schema[column]
+    return "✓" if dtype == exams_df.schema[column] else str(dtype)
+
+
+pl.DataFrame(
+    {"column": exams_df.columns}
+    | {fmt: [roundtrip(c, fmt) for c in exams_df.columns] for fmt in formats}
+)
+```
+
+Parquet and IPC store the Arrow schema in the file, so the Enum levels, the
+zone, the unsigned width and the decimal scale all survive. CSV turns `hn`
+into `12345`, as readr would (both guess a number). Excel refuses a zoned
+datetime and CSV refuses a list.
+
+### CSV: type inference {#sec-io-csv-infer}
+
+`pl_notes.datasets` reads `weather.csv` with `infer_schema_length=None` for
+a reason. Locate the file the way `datasets.py` does (without importing the
+package) and read it with only the `"NA"` fix:
+
+```{python}
+nyc_spec = importlib.util.find_spec("nycflights13")
+weather_path = Path(next(iter(nyc_spec.submodule_search_locations))) / "data" / "weather.csv"
+```
+
+```{python}
+#| error: true
+pl.read_csv(weather_path, null_values="NA")
+```
+
+`precip` is `0` in rows 0–254 and `0.05` in row 255, so 100 rows of zeros
+said `Int64`. Fixing that column alone moves the error to `visib`, whose
+first fraction is in row 258:
+
+```{python}
+#| error: true
+pl.read_csv(weather_path, null_values="NA", schema_overrides={"precip": pl.Float64})
+```
+
+Name both, or let inference see every row (the docstring warns that `None` is
+slow on big files; `10_000` is a middle ground):
+
+```{python}
+weather_df = pl.read_csv(
+    weather_path, null_values="NA", schema_overrides={"precip": pl.Float64, "visib": pl.Float64}
+)
+weather_df.equals(pl.read_csv(weather_path, null_values="NA", infer_schema_length=None))
+```
+
+The error message's fourth suggestion, `ignore_errors=True`, is the one to
+refuse:
+
+```{python}
+weather_df_ignored = pl.read_csv(weather_path, null_values="NA", ignore_errors=True)
+weather_df_ignored.select(pl.col("precip", "visib").null_count())
+```
+
+No error, and every hour with measurable rain (1,749 of them) is now null:
+"missing" instead of "raining". **The `problems()` equivalent:** read
+everything as text, cast to the guessed schema with `strict=False`, and count
+values present before the cast and null after it:
+
+```{python}
+guessed_schema = pl.scan_csv(weather_path, null_values="NA").collect_schema()  # 100-row guess
+weather_df_text = pl.read_csv(weather_path, null_values="NA", infer_schema=False)
+
+weather_df_text.select(
+    (pl.col(name).is_not_null() & pl.col(name).cast(dtype, strict=False).is_null())
+    .sum()
+    .alias(name)
+    for name, dtype in guessed_schema.items()
+).unpivot(variable_name="column", value_name="n_failed").filter(pl.col("n_failed") > 0)
+```
+
+The row-level version (which values failed) is a
+[Data Model recipe](../core/data-model.qmd#sec-dm-recipes).
+
+| Argument | Columns | Inference | Note |
+|---|---|---|---|
+| `schema={...}` | all | none | matched **by name** in 2.0: a name missing from the header, or a header name missing from `schema`, raises `SchemaError` |
+| `schema_overrides={...}` | some | for the rest | a misspelled name is **silently ignored** |
+| `infer_schema=False` | all `String` | none | ≈ `col_types = cols(.default = "c")` |
+| `infer_schema_length=n` | all | first *n* rows; `None` = all | ≈ `guess_max` |
+| `new_columns=`, `with_column_names=fn` | renames | — | ≈ `col_names = c(...)`, `name_repair = fn` |
+
+: Controlling dtypes {.striped}
+
+### CSV: nulls, dates, dialect {#sec-io-csv-dialect}
+
+An invented RIS export with the usual problems: hospital numbers with
+leading zeros, `-99` for "not recorded", Buddhist-era dates written
+day-first, and naive timestamps. Read plainly, `hn` becomes `12345`, `-99` a
+real dose, and both date columns strings:
+
+```{python}
+ris_csv = """hn,name,exam_date,arrived,dlp
+0012345,สมชาย ใจดี,15/01/2567,2024-01-15 08:30:00,512.4
+0098765,มาลี สุขใจ,01/02/2567,2024-02-01 14:05:00,-99
+""".encode()
+
+ris_df = pl.read_csv(
+    ris_csv,
+    schema_overrides={"hn": pl.String},
+    null_values={"dlp": "-99"},            # per column: {name: one string}
+    try_parse_dates=True,
+)
+ris_df
+```
+
+`try_parse_dates` read `01/02/2567` as **1 February**: slashes are taken
+day-first, which suits Thai data and misreads American data. It also accepts
+the year 2567. Buddhist-era years run 543 ahead:
+
+```{python}
+ris_df.with_columns(
+    pl.col("exam_date").dt.offset_by("-543y"),
+    pl.col("arrived").dt.replace_time_zone("Asia/Bangkok"),   # see @sec-io-tz-trap
+).select("hn", "exam_date", "arrived")
+```
+
+What `try_parse_dates=True` recognises (verified on 2.0): ISO dates and
+datetimes (a `Z` or `+07:00` suffix gives a UTC column), `dd/mm/yyyy`,
+`dd-mm-yyyy`, `dd.mm.yyyy`, and `HH:MM:SS`. `20240115` stays an integer,
+`15 Jan 2024` a string. One pattern is chosen per column from the inference
+rows, so a US date such as `02/15/2024` inside them leaves the column a
+string, and after them raises. Numbers have a similar edge: `NaN`, `inf` and
+`-inf` parse as floats, lowercase `nan` turns the column into a string.
+
+The rest of the dialect, on a semicolon export with title lines, a comment
+and decimal commas:
+
+```{python}
+workload_csv = """Radiology workload report
+Exported from RIS
+modality;n_exams;mean_dlp
+# CT includes PET-CT
+CT;1204;512,4
+MR;388;
+""".encode()
+
+pl.read_csv(workload_csv, skip_lines=2, separator=";", comment_prefix="#", decimal_comma=True)
+```
+
+| readr | Polars | Note |
+|---|---|---|
+| `skip = 2` | `skip_rows=2` / `skip_lines=2` | CSV rows (a quoted field may span lines) / raw lines |
+| `comment = "#"`, `locale(decimal_mark = ",")` | `comment_prefix="#"`, `decimal_comma=True` | |
+| `na = c("", "NA")` | `null_values=[...]` or `{col: str}` | `""` is null by default, a quoted `""` stays an empty string |
+| duplicate names → `a...1`, `a...2` | `a`, `a_duplicated_0` | |
+
+: Dialect options beyond the cheatsheet {.striped}
+
+A row with too few fields is padded with nulls; one with too many raises
+unless `truncate_ragged_lines=True`. Windows line endings and a UTF-8 BOM
+(Excel's "CSV UTF-8") need no options.
+
+### CSV: Thai legacy encodings {#sec-io-encoding}
+
+Older Thai Windows systems export TIS-620 / cp874, one byte per Thai
+character. Polars parses only UTF-8:
+
+```{python}
+patients_text = "hn,name,ward\n0012345,สมชาย ใจดี,อายุรกรรม\n0098765,มาลี สุขใจ,ศัลยกรรม\n"
+legacy_path = data_dir / "patients_cp874.csv"
+_ = legacy_path.write_bytes(patients_text.encode("cp874"))   # what the old export looks like
+```
+
+```{python}
+#| error: true
+pl.read_csv(legacy_path)
+```
+
+In 2.0, eager `read_csv()` accepts any Python codec name (`"cp874"`,
+`"tis-620"`, `"iso8859_11"`; not `"windows-874"`): it decodes the whole file
+in Python, re-encodes it as UTF-8 in memory, then parses. `scan_csv()`
+streams and can't: it raises `ValueError` for anything but `"utf8"` and
+`"utf8-lossy"`.
+
+```{python}
+pl.read_csv(legacy_path, encoding="cp874", schema_overrides={"hn": pl.String})
+```
+
+`"utf8-lossy"` replaces each byte sequence that isn't valid UTF-8 with `�`
+and keeps going:
+
+```{python}
+pl.read_csv(legacy_path, encoding="utf8-lossy", schema_overrides={"hn": pl.String})
+```
+
+The names are gone. And `㨴` is not a `�`: the cp874 bytes of `ใจด`
+(`E3 A8 B4`) happen to be valid UTF-8, so counting `�` undercounts the
+damage. readr has `guess_encoding()`; Polars has no detector, so know the
+source system.
+
+### CSV: writing {#sec-io-csv-write}
+
+```{python}
+report_df = pl.DataFrame({
+    "hn": ["0012345", "0098765"],
+    "name": ["ใจดี, สมชาย", 'Mali "M" S'],
+    "dlp": [0.1 + 0.2, 1e-7],
+    "n_series": [3, None],
+    "arrived": [dt.datetime(2024, 1, 15, 8, 30), dt.datetime(2024, 1, 15, 9, 5)],
+}).with_columns(pl.col("arrived").dt.replace_time_zone("Asia/Bangkok"))
+
+print(report_df.write_csv())   # no path: returns the text
+```
+
+Floats get every digit needed to read them back exactly, null is an empty
+field, quotes appear only where needed, and a zoned datetime keeps its
+offset (`+0700`) but not its zone name: `try_parse_dates=True` reads it back
+as UTC. The options:
+
+```{python}
+print(report_df.write_csv(
+    null_value="NA",
+    float_precision=3,                     # fixed decimals: 1e-7 becomes 0.000
+    datetime_format="%Y-%m-%d %H:%M",      # the offset is gone too
+    quote_style="non_numeric",
+))
+```
+
+| readr | Polars `write_csv()` | Note |
+|---|---|---|
+| `na = "NA"` (default) | `null_value="NA"` | Polars' default is an empty field |
+| `quote = "needed"` / `"all"` / `"none"` | `quote_style="necessary"` / `"always"` / `"never"` | plus `"non_numeric"`; `"never"` breaks `ใจดี, สมชาย` into two fields |
+| `write_excel_csv()` | `include_bom=True` | the BOM tells Excel the file is UTF-8, so Thai displays |
+| `write_csv(df, "f.csv.gz")` | `compression="gzip"` or `"zstd"` | the path must end in `.gz`, or `check_extension=False` |
+
+: Writing CSV {.striped}
+
+`Duration`, `List`, `Struct` and `Array` columns can't be written to CSV
+(`ComputeError`).
+
+### Parquet {#sec-io-parquet}
+
+The same `flights` table in each format, written to memory (the sizes are
+reproducible):
+
+```{python}
+flights_df = datasets.flights()
+writers = {
+    "csv": flights_df.write_csv,
+    "csv, gzip": partial(flights_df.write_csv, compression="gzip"),
+    "ndjson": flights_df.write_ndjson,
+    "ipc": flights_df.write_ipc,
+    "ipc, zstd": partial(flights_df.write_ipc, compression="zstd"),
+    "parquet, uncompressed": partial(flights_df.write_parquet, compression="uncompressed"),
+    "parquet, snappy": partial(flights_df.write_parquet, compression="snappy"),
+    "parquet, zstd": flights_df.write_parquet,
+}
+
+
+def size_mb(write) -> float:
+    buffer = io.BytesIO()
+    write(buffer)
+    return round(buffer.getbuffer().nbytes / 1e6, 1)
+
+
+pl.DataFrame({"format": list(writers), "MB": [size_mb(w) for w in writers.values()]})
+```
+
+Uncompressed Parquet is already a sixth of the CSV: each column is stored
+separately and dictionary/run-length encoded (`RLE_DICTIONARY`), so repeated
+carriers, airports and years cost almost nothing. The codec matters less:
+`zstd` is the default (`compression_level=` 1–22, default 3); `gzip` and
+`brotli` land within 5% of it, and `snappy` is for old readers.
+
+Read part of a file, its schema, or its key-value metadata without the data.
+`write_parquet(metadata=)` stores strings in the file footer, a good place for
+provenance:
+
+```{python}
+exams_path = data_dir / "exams.parquet"
+exams_df.write_parquet(exams_path, metadata={"source": "RIS export", "exported": "2024-02-01"})
+
+print(pl.read_parquet(exams_path, columns=["hn", "modality"], n_rows=1))
+print(pl.read_parquet_schema(exams_path)["arrived"])
+{k: v for k, v in pl.read_parquet_metadata(exams_path).items() if k != "ARROW:schema"}
+```
+
+Two layout options pay off at read time. `row_group_size=` sets rows per row
+group, the unit a reader can skip; `statistics=True` (the default) writes each
+row group's min, max and null count per column (`"full"` adds distinct
+counts). A filtered `scan_parquet()` skips row groups whose statistics rule
+them out ([Lazy API](lazy.qmd#sec-lazy-sources)), so sort by a common filter
+column before writing.
+
+**The bridge to R.** Polars writes standard Arrow types. What the file holds
+was checked with `pyarrow` against a Polars-written file; the R column follows
+arrow's documented type mapping (R not run here):
+
+| Polars dtype | Arrow type in the file | `arrow::read_parquet()` in R |
+|---|---|---|
+| `Enum` | dictionary, `ordered=True` | factor |
+| `Categorical` | dictionary | factor |
+| `Datetime("us", "Asia/Bangkok")` | `timestamp[us, tz=Asia/Bangkok]` | POSIXct in that zone |
+| `Date` | `date32` | `Date` |
+| `Decimal(10, 2)` | `decimal128(10, 2)` | double |
+| `List(String)`, `Struct` | `large_list`, `struct` | list-column, data-frame column |
+
+: Polars → Parquet → R {.striped}
+
+The way back loses one thing. An Arrow dictionary without Polars' own field
+metadata, which is what R's arrow writes for a factor, reads as
+`Categorical`, even when ordered. Restore the levels with
+`cast(pl.Enum([...]))`.
+
+### IPC / Feather {#sec-io-ipc}
+
+Arrow IPC is the in-memory layout written to disk: fast, and large unless
+compressed (62 MB vs 6.9 MB above). Feather v2 *is* the IPC file format, so
+R reads it with `arrow::read_feather()`:
+
+```{python}
+exams_ipc = data_dir / "exams.arrow"
+exams_df.write_ipc(exams_ipc, compression="zstd")    # or "lz4"; default "uncompressed"
+exams_ipc.read_bytes()[:6], pl.read_ipc(exams_ipc).equals(exams_df)
+```
+
+Polars writes the newest Arrow types by default (strings as `string_view`);
+for an older Arrow reader pass `compat_level=pl.CompatLevel.oldest()`, which
+writes `large_string`. Parquet for archives and exchange, IPC for short-lived
+handoffs.
+
+### NDJSON and JSON {#sec-io-json}
+
+```{python}
+exams_json = exams_df.select("hn", "exam_date", "findings").head(2).write_ndjson()
+print(exams_json)
+pl.read_ndjson(exams_json.encode(), schema_overrides={"exam_date": pl.Date}).schema
+```
+
+One object per line: lists and structs survive, dates return as strings
+unless overridden. `write_json()` writes one array of row objects instead.
+Rectangling arbitrary JSON is in [Nested Data](../types/nested.qmd).
+
+### Excel {#sec-io-excel}
+
+`write_excel()` writes through `xlsxwriter`. For several sheets (≈
+`writexl::write_xlsx(list(a = df1, b = df2))`), open the workbook yourself
+and pass it in. Excel has no time zones (a zoned column raises `TypeError`)
+and no lists, so flatten first:
+
+```{python}
+exams_xlsx = data_dir / "exams.xlsx"
+exams_df_flat = exams_df.with_columns(
+    pl.col("arrived").dt.replace_time_zone(None),
+    pl.col("findings").list.join("; "),
+)
+
+with xlsxwriter.Workbook(exams_xlsx) as workbook:
+    for (day,), exams_df_day in exams_df_flat.partition_by("exam_date", as_dict=True).items():
+        exams_df_day.write_excel(workbook, worksheet=str(day))
+    exams_df_flat.write_excel(
+        workbook,
+        worksheet="ทั้งหมด",                        # "all"
+        autofit=True,
+        freeze_panes="A2",                         # keep the header visible
+        dtype_formats={pl.Datetime: "dd/mm/yyyy hh:mm"},
+    )
+
+{name: sheet_df.shape for name, sheet_df in pl.read_excel(exams_xlsx, sheet_id=0).items()}
+```
+
+`sheet_id=0` reads every sheet into a `{name: DataFrame}` dict;
+`sheet_name=` or `sheet_id=` (1-based) picks one, and the default is the
+first. Formats change what a cell **displays**, not what it stores;
+`float_precision=` (default 3) is a display format too.
+
+On the way back (@sec-io-dtypes), `hn` stays text because it was written as
+text. Excel stores every number as a double and Polars turns whole-number
+columns back into `Int64`, so `n_images` loses its `UInt16`; datetimes return
+in milliseconds. The readxl arguments map as below; `read_options` goes to the
+default `calamine` engine (via `fastexcel`) and handles title rows above the
+header:
+
+| readxl | `pl.read_excel()` |
+|---|---|
+| `sheet = "CT"`, `excel_sheets()` | `sheet_name="CT"`, `sheet_id=0` (all, as a dict) |
+| `skip = 2` | `read_options={"header_row": 2}` (0-based row of the header) |
+| `range = cell_cols("A:C")` | `read_options={"use_columns": "A:C"}` or `columns=[...]` |
+| `col_types = ...` | `schema_overrides={...}` |
+| `guess_max = 1000` (default) | `infer_schema_length=100` (default) |
+| `na = c("", "NA")` | in a numeric column, `""`, `NA`, `N/A`, `n/a`, `#N/A`, `NULL` read as null; in a text column they stay text |
+
+: readxl → Polars {.striped}
+
+The difference in guess windows matters more for Excel than for CSV
+(@sec-io-excel-trap).
+
+### Databases {#sec-io-db}
+
+`pl.read_database()` takes a SQL string and any DB-API connection, including
+the standard library's `sqlite3`. `write_database()` does not: it needs
+a SQLAlchemy or ADBC connection (or a URI for one), and neither is installed
+here.
+
+```{python}
+#| error: true
+con = sqlite3.connect(":memory:")
+exams_df.select("hn", "exam_date").write_database("exams", con)
+```
+
+The standard-library route is `executemany()` over `iter_rows()`, with dates
+cast to ISO strings first (SQLite has no date type, and Python's implicit date
+adapter is deprecated since 3.12):
+
+```{python}
+con.execute(
+    "CREATE TABLE exams (hn TEXT, modality TEXT, exam_date TEXT, tat_min REAL, n_images INTEGER)"
+)
+exams_df_db = exams_df.select("hn", "modality", "exam_date", "tat_min", "n_images").with_columns(
+    pl.col("modality", "exam_date").cast(pl.String)
+)
+con.executemany("INSERT INTO exams VALUES (?, ?, ?, ?, ?)", exams_df_db.iter_rows())
+
+pl.read_database(
+    "SELECT * FROM exams WHERE hn = ?",
+    con,
+    execute_options={"parameters": ["0012345"]},   # placeholders, never f-strings
+    schema_overrides={"n_images": pl.Int32},
+).with_columns(pl.col("exam_date").str.to_date())
+```
+
+The frame is built from the Python values the driver returns, so
+`schema_overrides` converts between compatible types but doesn't parse:
+`{"exam_date": pl.Date}` on SQLite's text raises. Parse afterwards, as above.
+A SQLite query that returns no rows gives all-`Null` columns (no declared
+type to fall back on), and `iter_batches=True` needs `batch_size=`.
+
+| DBI | Polars | Requires |
+|---|---|---|
+| `dbGetQuery(con, sql, params = )` | `pl.read_database(sql, con, execute_options={"parameters": ...})` | a DB-API connection, SQLAlchemy, or ADBC |
+| `dbSendQuery()` + `dbFetch(n = )` | `read_database(..., iter_batches=True, batch_size=n)` | |
+| `dbGetQuery()` on a server database | `pl.read_database_uri(sql, "postgresql://…")` | `connectorx` (default) or ADBC |
+| `dbWriteTable()` | `df.write_database(name, connection, if_table_exists=)` | SQLAlchemy or ADBC |
+| dbplyr `tbl()` | none: send SQL, or load and go [lazy](lazy.qmd) | |
+
+: DBI → Polars {.striped}
+
+### Many files and cloud storage {#sec-io-many}
+
+Four monthly exports; March gained a column, April reordered its columns:
+
+```{python}
+exports_dir = data_dir / "exports"
+exports_dir.mkdir()
+exports = {
+    "2024-01": "accession,modality,tat_min\nA1,CT,35\nA2,MR,50\n",
+    "2024-02": "accession,modality,tat_min\nB1,XR,12.5\n",
+    "2024-03": "accession,modality,tat_min,radiologist\nC1,CT,40,Dr. A\n",
+    "2024-04": "accession,tat_min,modality\nD1,22,US\n",
+}
+for month, text in exports.items():
+    (exports_dir / f"exams_{month}.csv").write_text(text)
+```
+
+A glob reads matching files as one table. Inference spans files
+(`infer_schema_files=10`), so January's integers and February's float agree on
+`Float64`; `include_file_paths=` adds the source (≈ `read_csv(files, id = )`);
+`missing_columns="insert"` (unstable) fills a column some files lack:
+
+```{python}
+pl.read_csv(
+    exports_dir / "exams_2024-0[1-3].csv", include_file_paths="path", missing_columns="insert"
+).with_columns(month=pl.col("path").str.extract(r"(\d{4}-\d{2})")).drop("path")
+```
+
+A glob still expects one column order:
+
+```{python}
+#| error: true
+pl.read_csv(exports_dir / "exams_2024-0[124].csv")
+```
+
+When files disagree, read them one by one and stack with
+`how="diagonal_relaxed"`: columns matched by name, missing ones filled with
+null, dtypes widened (@sec-io-recipes).
+
+**Cloud storage** (described, not run). The readers and writers also take
+`s3://`, `gs://`, `az://` and `hf://` paths; the docstrings list AWS, GCP,
+Azure and Hugging Face. Credentials go in `storage_options={...}` (keys such
+as `"aws_region"`); without it, Polars looks in environment variables. Use
+`scan_parquet()` on cloud data so pushdown limits what is downloaded.
+
+## Where it bites {#sec-io-gotchas}
+
+| readr / readxl / DBI | Polars |
+|---|---|
+| guesses from 1,000 rows | CSV and Excel guess from the first **100** |
+| a parse failure → `NA` + `problems()` | CSV raises; `ignore_errors=True` nulls silently (@sec-io-csv-infer) |
+| `"NA"` is missing | a string unless `null_values="NA"` ([Missing Values](../types/missing.qmd#sec-na-nan)) |
+| dates parsed by default | strings unless `try_parse_dates=True`; slashes day-first; any year accepted |
+| `locale(tz = )` places naive times in that zone | a zoned dtype in `schema_overrides` reads naive times as **UTC** (@sec-io-tz-trap) |
+| readxl: text in a numeric column → `NA` + warning | past the guess window: null, no warning, maybe a lost row (@sec-io-excel-trap) |
+| `locale(encoding = )` works everywhere | only eager `read_csv()` decodes non-UTF-8; `utf8-lossy` destroys Thai |
+| `write_csv()` writes `NA` for missing | an empty field; `float_precision=` can write `0.000` |
+| `dbWriteTable()` on any connection | `write_database()` needs SQLAlchemy or ADBC |
+
+: The differences at a glance {.striped}
+
+### Excel: values past the guess window vanish {#sec-io-excel-trap}
+
+CSV raises when a later value breaks the guess. Excel doesn't. A dose column
+with 120 numbers, then 30 cells of text:
+
+```{python}
+doses_xlsx = data_dir / "doses.xlsx"
+with xlsxwriter.Workbook(doses_xlsx) as workbook:
+    sheet = workbook.add_worksheet()
+    sheet.write(0, 0, "dose_mg")
+    for row in range(150):
+        sheet.write(row + 1, 0, 1.5 if row < 120 else "pending")
+
+doses_df = pl.read_excel(doses_xlsx)
+doses_df_full = pl.read_excel(doses_xlsx, infer_schema_length=None)
+{
+    "default": (doses_df.height, doses_df.schema["dose_mg"], doses_df["dose_mg"][-1]),
+    "infer_schema_length=None": (
+        doses_df_full.height, doses_df_full.schema["dose_mg"], doses_df_full["dose_mg"][-1]
+    ),
+}
+```
+
+With the default 100-row sample the column is `Float64`, each `"pending"`
+becomes null, and because those rows are then entirely null,
+`drop_empty_rows=True` (the default) deletes them: 150 rows in the sheet,
+120 in the frame, no warning. `read_options={"dtype_coercion": "strict"}`
+doesn't help; it checks only the sampled rows. (Mixed cells *inside* the
+sample make the whole column `String`.) For any sheet a person typed into,
+pass `infer_schema_length=None` or `schema_overrides`, and check `height`.
+
+### A naive timestamp read into a zone is taken as UTC {#sec-io-tz-trap}
+
+```{python}
+arrived_csv = b"arrived\n2024-01-15 08:30:00\n"
+pl.concat([
+    pl.read_csv(arrived_csv, schema_overrides={"arrived": pl.Datetime("us", "Asia/Bangkok")}),
+    pl.read_csv(arrived_csv, try_parse_dates=True)
+    .with_columns(pl.col("arrived").dt.replace_time_zone("Asia/Bangkok")),
+])
+```
+
+Same string, seven hours apart. The reader treats a naive string as UTC and
+*converts* it to the zone; `replace_time_zone()` (like
+`str.to_datetime(time_zone=)`) *attaches* the zone to the wall-clock time,
+as readr's `locale(tz = )` does. Read naive, then attach
+([Dates, Times & Durations](../types/datetime.qmd#sec-dt-tz)).
+
+## Recipes {#sec-io-recipes}
+
+**A folder of monthly exports, month from the file name** (≈ `files |>
+set_names() |> map(read_csv) |> list_rbind(names_to = "file")`). Robust to
+added and reordered columns, and lazy until `collect()`:
+
+```{python}
+pl.concat(
+    [pl.scan_csv(path, include_file_paths="path") for path in sorted(exports_dir.glob("*.csv"))],
+    how="diagonal_relaxed",
+).with_columns(
+    month=pl.col("path").str.extract(r"(\d{4}-\d{2})").str.to_date("%Y-%m")
+).drop("path").collect()
+```
+
+**Convert a legacy TIS-620 export to Parquet once.** Decode, type, store;
+every later read is fast, typed and lazy:
+
+```{python}
+patients_path = data_dir / "patients.parquet"
+(
+    pl.read_csv(legacy_path, encoding="cp874", schema_overrides={"hn": pl.String})
+    .with_columns(pl.col("ward").cast(pl.Categorical))
+    .write_parquet(patients_path, metadata={"source": "patients_cp874.csv (cp874)"})
+)
+pl.scan_parquet(patients_path).filter(pl.col("hn") == "0012345").collect()
+```
+
+**Every sheet of a workbook, stacked** (≈ `excel_sheets() |> set_names() |>
+map(\(s) read_excel(path, s)) |> list_rbind(names_to = "sheet")`):
+
+```{python}
+pl.concat(
+    [sheet_df.with_columns(sheet=pl.lit(name))
+     for name, sheet_df in pl.read_excel(exams_xlsx, sheet_id=0).items() if name != "ทั้งหมด"],
+    how="diagonal_relaxed",
+).select("sheet", "hn", "modality", "tat_min")
+```
+
+```{python}
+#| include: false
+con.close()
+tmp.cleanup()
+```
+
+## See also {#sec-io-see-also}
+
+- Cheatsheet: [Import, Export & Inspect](../overview/polars-cheatsheet.qmd#sec-cs-io) ·
+  [SQL & Interop](../overview/polars-cheatsheet.qmd#sec-cs-sql)
+- Next: [Lazy API](lazy.qmd) (`scan_*`, pushdown, hive partitions, `sink_*`) ·
+  [Missing Values](../types/missing.qmd) (null vs `NaN`, `"NA"`) ·
+  [Data Model](../core/data-model.qmd#sec-dm-casting) (strict casts) ·
+  [Dates, Times & Durations](../types/datetime.qmd) ·
+  [Nested Data](../types/nested.qmd) (JSON)
+- Polars: user guide [IO](https://docs.pola.rs/user-guide/io/) (Excel, databases,
+  cloud storage) · API [Input/output](https://docs.pola.rs/api/python/stable/reference/io.html) ·
+  [fastexcel](https://fastexcel.toucantoco.dev/) · [XlsxWriter](https://xlsxwriter.readthedocs.io/)
+- R side: R4DS 2e [Data import](https://r4ds.hadley.nz/data-import.html) ·
+  [Spreadsheets](https://r4ds.hadley.nz/spreadsheets.html) ·
+  [Databases](https://r4ds.hadley.nz/databases.html) ·
+  [Arrow](https://r4ds.hadley.nz/arrow.html)

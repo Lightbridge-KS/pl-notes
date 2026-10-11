@@ -1,0 +1,544 @@
+---
+title: "Categorical & Enum"
+subtitle: "≈ forcats · factors · `ordered()`"
+jupyter: python3
+---
+
+R has one type for categorical data: the factor. Polars has two. An `Enum`
+fixes its levels, in order, when the dtype is created. It is the closer
+analogue of a factor, and every Enum behaves like an *ordered* factor. A
+`Categorical` fixes nothing: its codes point into one string table shared by
+the whole process, and it sorts by the strings. This chapter covers how each
+works in 2.0, how to convert between them and `String`, the forcats verbs as
+Polars recipes, and the places where the two types silently disagree.
+
+## In tidyverse {#sec-cat-tidyverse}
+
+```r
+library(dplyr)
+library(forcats)
+
+f <- factor(c("lo", "hi", "mid", "lo"), levels = c("lo", "mid", "hi"))
+levels(f)                            # "lo" "mid" "hi"
+as.integer(f)                        # 1 3 2 1: codes into the levels
+sort(f)                              # lo lo mid hi: level order, not alphabetical
+factor("huge", levels = levels(f))   # NA, silently
+fct("huge", levels = levels(f))      # error (forcats >= 1.0)
+
+o <- ordered(c("lo", "hi"), levels = c("lo", "mid", "hi"))
+o < "mid"                            # TRUE FALSE (an unordered factor warns: NA)
+
+tibble(f = f[f != "mid"]) |> count(f, .drop = FALSE)   # mid appears with n = 0
+```
+
+A factor is an integer vector plus a `levels` attribute, one per vector.
+forcats edits that attribute: it reorders it (`fct_infreq()`, `fct_reorder()`),
+renames entries (`fct_recode()`) or merges them (`fct_lump()`). Polars has no
+attribute to edit. An Enum's levels are part of its **dtype**, so every forcats
+verb becomes "compute the new levels, then cast".
+
+## Mental model {#sec-cat-model}
+
+```text
+ R factor            codes  2 1 3 1            1-based integers
+                     levels "a" "b" "c"        an attribute of THIS vector
+
+ Polars Enum         dtype  Enum(["lo", "mid", "hi"])   the levels ARE the dtype:
+                     codes  2 0 1 0                     fixed, ordered, in the schema
+                            UInt8 (≤ 255 levels) · UInt16 (≤ 65,535) · UInt32
+   → sort, <, max(), rank() follow level order; a value outside the levels is an error
+
+ Polars Categorical  dtype  Categorical(Categories())   no levels in the dtype
+                     codes  ids in ONE process-wide table, UInt32
+                     table  pl.Categories():  "lo"→0  "hi"→1  "mid"→2  …
+   → any string is accepted; sort and < compare the strings (lexical order)
+```
+
+|  | R factor | `Enum` | `Categorical` |
+|---|---|---|---|
+| Levels | per vector, set at creation | in the dtype, fixed | none: a global table that grows |
+| Sort and `<` | level order (`<` needs `ordered()`) | level order | string order |
+| Value not in the levels | `factor()` → `NA`, `fct()` → error | error; `strict=False` → null | accepted |
+| Codes | 1-based, per vector | 0-based, per dtype | global ids, not stable between runs |
+| Two columns combine when | always: levels are unioned | the level lists are identical | always |
+| `levels(f)` | `levels(f)` | `dtype.categories` | `unique().sort()` |
+
+: Factor, Enum, Categorical {.striped}
+
+**Rule of thumb:** use `Enum` whenever you know the levels or care about
+their order. Use `Categorical` for open-ended labels you only want stored
+compactly. Polars' own [binning](logic-numbers.qmd) agrees:
+`bin_intervals()` (≈ `cut()`) returns an Enum.
+
+## Mechanics {#sec-cat-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import io
+
+import polars as pl
+from pl_notes import datasets
+
+penguins_df = datasets.penguins()   # species, island, sex are String
+flights_df = datasets.flights()
+```
+
+### Enum: levels fixed up front {#sec-cat-enum}
+
+```{python}
+size_enum = pl.Enum(["lo", "mid", "hi"])
+sizes = pl.Series("size", ["hi", "lo", "mid", "lo"], dtype=size_enum)
+sizes.dtype.categories.to_list(), sizes.to_physical().to_list()
+```
+
+`dtype.categories` is a `String` Series of the levels (≈ `levels()`), and the
+codes are 0-based ([Data Model](../core/data-model.qmd#sec-dm-physical)).
+Levels usually come from the data:
+
+```{python}
+{
+    "sorted, as factor()": pl.Enum(penguins_df["island"].unique().sort()),
+    "first seen, as fct_inorder()": pl.Enum(penguins_df["island"].unique(maintain_order=True)),
+}
+```
+
+Levels must be unique, non-null strings. `pl.Enum()` raises a `TypeError` on
+a null, so `drop_nulls()` a column like `sex` first. `unique().sort()` sorts by
+code point (C locale), whereas `factor()` sorts in the session locale. A
+string-valued Python `enum.Enum` class works as the level list too.
+
+A value outside the levels is an error, wherever the cast happens:
+
+```{python}
+#| error: true
+pl.Series(["lo", "huge"]).cast(size_enum)
+```
+
+```{python}
+pl.Series(["lo", "huge"]).cast(size_enum, strict=False).to_list()
+```
+
+So `cast()` is `fct()`, and `strict=False` is `factor()`. The same check runs
+in `pl.Series(..., dtype=)`, `pl.DataFrame(..., schema=)` and at read time
+(@sec-cat-recipes).
+
+### Order: levels, not letters {#sec-cat-order}
+
+Every Enum is ordered. Sorting, comparisons, `min()`/`max()`, `rank()` and
+`is_between()` all follow the level order:
+
+```{python}
+sizes_df = pl.DataFrame({"size": ["hi", "lo", "mid", None, "lo"]}, schema={"size": size_enum})
+
+sizes_df.with_columns(
+    below_mid=pl.col("size") < "mid",
+    lo_to_mid=pl.col("size").is_between(pl.lit("lo"), pl.lit("mid")),   # bare strings = columns
+    rank=pl.col("size").rank("dense"),
+).sort("size")
+```
+
+The string `"mid"` is cast to the Enum before the comparison (the bounds of
+`is_between()` need `pl.lit()`, see
+[When is a string a column?](../core/expressions.qmd#sec-expr-literals)). A
+string that is not a level makes `<` fail, while `==` and `is_in()` simply
+return false:
+
+```{python}
+#| error: true
+sizes_df.filter(pl.col("size") < "huge")
+```
+
+```{python}
+sizes_df.select(
+    eq_any=(pl.col("size") == "huge").any(), is_in_any=pl.col("size").is_in(["huge"]).any()
+)
+```
+
+A typo in an equality filter therefore returns zero rows instead of an error.
+
+### Categorical: one string table per process {#sec-cat-categorical}
+
+The `Categorical` dtype's only parameter is a `pl.Categories` object, and the
+default is the global one. Two Series built separately share it:
+
+```{python}
+sizes_a = pl.Series(["lo", "hi"], dtype=pl.Categorical)
+sizes_b = pl.Series(["mid", "lo"], dtype=pl.Categorical)
+{
+    "dtype": sizes_a.dtype,
+    "codes a": sizes_a.to_physical().to_list(),
+    "codes b": sizes_b.to_physical().to_list(),
+    "b.dtype.categories": list(sizes_b.dtype.categories),
+}
+```
+
+`"lo"` is code 0 in both, because a Categorical code is an id in a string
+table (an interning table) that every default Categorical in the process
+shares. Three consequences:
+
+1. **No string cache.** Categoricals built separately concatenate, compare and
+   join directly. `pl.StringCache()` and `pl.enable_string_cache()` still
+   exist, but do nothing (deprecated since 1.41; `StringCache()` emits a
+   `DeprecationWarning`).
+2. **`dtype.categories` is not the column's levels.** It is the whole table:
+   `sizes_b` contains no `"hi"`. A column's levels are `unique().sort()`
+   (`cat.get_categories()` is gone).
+3. **Codes are not stable.** They depend on what the process interned before,
+   and in what order. Casting several columns in one `with_columns()` interns
+   them concurrently: six runs of the same penguins cast gave `Adelie` the code
+   0, 1 or 3. Never store or compare Categorical codes. Enum codes are fixed
+   by the level list.
+
+```{python}
+pl.DataFrame({"size": sizes_a, "a": [1, 2]}).join(
+    pl.DataFrame({"size": sizes_b, "b": [10, 20]}),
+    on="size", how="left", maintain_order="left",
+)
+```
+
+The `cat` namespace is small in 2.0: `starts_with()`, `ends_with()`,
+`len_chars()`, `len_bytes()` and `slice()` (which returns `String`), plus the
+unstable `physical()` and `to()`. Any other `str.*` method raises a
+`SchemaError` on a Categorical, so cast to `String` first.
+
+```{python}
+penguins_df.select(pl.col("island").cast(pl.Categorical)).select(
+    "island",
+    starts_d=pl.col("island").cat.starts_with("D"),
+    abbrev=pl.col("island").cat.slice(0, 3),
+).unique().sort("island")
+```
+
+### Converting and combining {#sec-cat-casts}
+
+| From → to | Behaviour |
+|---|---|
+| `String` or `Categorical` → `Enum` | strict: unknown values raise; `strict=False` → null |
+| `Enum` → another `Enum` | values kept, codes remapped; a value missing from the new levels raises |
+| `Enum` or `Categorical` → `String`; `String` or `Enum` → `Categorical` | always works |
+| `Enum` or `Categorical` → integer | `ComputeError`; `to_physical()` returns the codes |
+| integer codes → `Enum` or `Categorical` | `cast()` is unsupported; `.cat.to(dtype)` (unstable) |
+
+: Casts (verified on Polars 2.0.0) {.striped}
+
+`cat.to()` is the inverse of `to_physical()`, for data that arrives coded
+(≈ `factor(code, levels = 0:2, labels = c("lo", "mid", "hi"))`). An
+out-of-range code raises, or becomes null with `strict=False`:
+
+```{python}
+pl.Series("code", [0, 2, 1]).cat.to(size_enum).to_list()
+```
+
+Combining two columns requires the same dtype. For an Enum, "the same" means
+the same levels in the same order:
+
+| Left | Right | `join` key, `==`, `concat()` | `concat(how="vertical_relaxed")` |
+|---|---|---|---|
+| `Categorical` | `Categorical` | works | works |
+| `Enum` | identical `Enum` | works | works |
+| `Enum` | `Enum` with other levels, or the same levels reordered | `SchemaError` | `SchemaError` |
+| `Categorical` or `Enum` | `String` | `SchemaError` (but `==` works) | `String` |
+| `Enum` | `Categorical` | `SchemaError` | `SchemaError` |
+
+: Key and column dtype pairs (verified on Polars 2.0.0) {.striped}
+
+`bind_rows()` (via vctrs) unions the levels of two factors for you. Polars
+makes you build the union, which also means you choose its order:
+
+```{python}
+#| error: true
+small_df = pl.DataFrame({"size": ["lo", "hi"]}, schema={"size": size_enum})
+xl_df = pl.DataFrame({"size": ["xl"]}, schema={"size": pl.Enum(["xl"])})
+pl.concat([small_df, xl_df])
+```
+
+```{python}
+size_enum_all = pl.Enum([*size_enum.categories, *xl_df.schema["size"].categories])
+pl.concat([small_df.cast({"size": size_enum_all}), xl_df.cast({"size": size_enum_all})])
+```
+
+### Why bother: memory and speed {#sec-cat-why}
+
+```{python}
+key_cols = ["carrier", "origin", "dest", "tailnum"]
+keys_df_str = flights_df.select(key_cols)
+keys_df_cat = keys_df_str.cast(pl.Categorical)
+keys_df_enum = keys_df_str.cast(
+    {c: pl.Enum(keys_df_str[c].drop_nulls().unique().sort()) for c in key_cols}
+)
+
+pl.DataFrame({
+    "dtype": ["String", "Categorical", "Enum"],
+    **{
+        f"{c} (kB)": [round(df[c].estimated_size("kb")) for df in (keys_df_str, keys_df_cat, keys_df_enum)]
+        for c in key_cols
+    },
+})
+```
+
+The Enum columns use `UInt8` codes, 1 byte per row, except `tailnum`, whose
+4,043 levels need `UInt16`; its extra 41 kB is the null bitmap. Every
+Categorical code is a `UInt32`, 4 bytes per row. For the short codes the
+`String` row even looks smaller than Categorical, but `estimated_size()`
+undercounts strings. It counts only the characters:
+
+```{python}
+flights_df["carrier"].estimated_size(), flights_df["carrier"].str.len_bytes().sum()
+```
+
+Each `String` value also has a 16-byte *view* (the Arrow string-view layout;
+strings of up to 12 bytes are stored inside it), and the estimate leaves the
+views out. Measured as process memory on 20 million two-letter values, String
+took about 16 bytes per row, Categorical 4, and Enum 1 to 1.5.
+
+Speed, measured on `flights` (medians of 20–25 runs, repeated in separate
+sessions; read the ratios, not the milliseconds):
+
+| Operation (ms) | `String` | `Categorical` | `Enum` |
+|---|---|---|---|
+| `sort("dest")` | 8–12 | 6–9 | 2–3 |
+| `group_by("dest").len()` | 1.6–1.9 | 1.0–1.3 | 0.7–0.8 |
+| `group_by("carrier", "origin", "dest").len()` | 2.0–2.5 | 1.7–2.1 | 1.7–1.9 |
+| left join to `airports` on `dest` | 1.8–2.0 | 1.3 | 1.3 |
+| the cast from `String` itself | — | 3.1–3.3 | 3.2 |
+
+: Timings on an Apple M3 Pro, Polars 2.0.0 {.striped}
+
+An Enum sorts by integer code. A Categorical has to compare strings to sort
+lexically, so it gains little there. Grouping and joining on codes avoids
+hashing strings, but with several keys the gain shrinks. The cast costs more
+than one `group_by()` saves, so cast once, ideally at read time, for a
+column you sort, group or join repeatedly, not before a one-off summary.
+
+## Where it bites {#sec-cat-gotchas}
+
+| R behaviour | Polars behaviour |
+|---|---|
+| a factor sorts by level order | an Enum does; a Categorical sorts and compares by **string** |
+| assigning a non-level to a factor warns (`invalid factor level`) | `fill_null("x")` on an Enum without the level `"x"` **silently keeps the nulls** |
+| `levels(f)` | Enum: `dtype.categories`; on a Categorical that is the whole process's table |
+| `bind_rows()` / `c()` union factor levels | Enums with different levels don't concat, compare or join |
+| a factor key joins a character key | `String` vs `Categorical`/`Enum` key: `SchemaError` ([Joins](../transform/joins.qmd#sec-join-dtypes)) |
+| `where(is.factor)` | `cs.categorical()` misses Enum: add `cs.enum()` ([Selectors](../core/selectors.qmd#sec-sel-cs)) |
+| `as.integer(f)` is 1-based and per vector | `to_physical()` is 0-based; Categorical codes are global and unstable |
+| stringr functions accept factors | `str.*` on a Categorical raises: cast to `String`, or use `cat.*` |
+| `count(f, .drop = FALSE)` keeps empty levels | `group_by()` never does: join onto the levels (@sec-cat-recipes) |
+
+: The differences at a glance {.striped}
+
+### `fill_null()` with a new value does nothing {#sec-cat-fill-null}
+
+```{python}
+sex_enum = pl.Enum(["female", "male"])
+penguins_df.select(pl.col("sex").cast(sex_enum)).select(
+    nulls_before=pl.col("sex").null_count(),
+    nulls_after=pl.col("sex").fill_null("unknown").null_count(),
+)
+```
+
+No error and no warning. The fill value is cast to the column's dtype
+non-strictly, so `"unknown"` becomes null and fills the nulls with null.
+`pl.coalesce()` behaves the same way. `replace()` and `when/then/otherwise()`
+with a non-level raise an `InvalidOperationError` instead. The fix is to add
+the level first (`fct_na_value_to_level()` in @sec-cat-recipes).
+
+### Lexical vs level order {#sec-cat-lexical}
+
+The same filter on the same values returns different rows depending on the
+dtype:
+
+```{python}
+{
+    dtype: sizes_df.cast({"size": dtype}).filter(pl.col("size") < "mid")["size"].to_list()
+    for dtype in [size_enum, pl.Categorical, pl.String]
+}
+```
+
+`"hi" < "mid"` alphabetically. Casting an Enum to Categorical to make a join
+or concat work quietly changes every sort, comparison, `max()` and `rank()`
+on that column ([Sort rows](../transform/verbs.qmd#sec-verb-sort) shows the
+sort). Polars 1.x sorted a Categorical by code (first appearance) by default.
+2.0 removed the `ordering=` parameter, and lexical order is the only one.
+
+### Old `pl.Categorical("lexical")` code {#sec-cat-legacy}
+
+In 1.x the first argument of `pl.Categorical` was `ordering`. In 2.0 it is a
+`Categories`, and a string is read as the **name** of a separate table. Old
+code still runs, but it builds a dtype that matches no other Categorical:
+
+```{python}
+#| error: true
+legacy_df = pl.DataFrame({"size": ["lo"]}, schema={"size": pl.Categorical("lexical")})
+print(legacy_df.schema)
+legacy_df.join(pl.DataFrame({"size": ["lo"]}, schema={"size": pl.Categorical}), on="size")
+```
+
+Named tables (`pl.Categories("name", physical=pl.UInt8)`) are an unstable
+feature for narrower codes or isolated tables. Unless you need one, write
+plain `pl.Categorical`.
+
+## Recipes {#sec-cat-recipes}
+
+An Enum's levels are part of the schema, and a schema is known before any data
+is read (a `LazyFrame` reports it without computing anything, see
+[Data Model](../core/data-model.qmd#sec-dm-containers)). So a forcats verb
+whose levels depend on the data takes two steps: compute the levels with a
+small query, then cast. In lazy code, `collect()` the levels first. The basic
+translations (`factor()`, `levels()`, `fct_recode()`) are in the cheatsheet's
+[Factors](../overview/polars-cheatsheet.qmd#sec-cs-factors).
+
+| forcats | Levels to pass to `pl.Enum()` |
+|---|---|
+| `fct_inorder(f)` | `s.unique(maintain_order=True)` |
+| `fct_infreq(f)` | `s.value_counts().sort(["count", "f"], descending=[True, False])["f"]` |
+| `fct_rev(f)` | `dtype.categories.reverse()` |
+| `fct_reorder(f, x)` | `df.group_by("f").agg(pl.col("x").median()).sort("x", "f")["f"]` |
+| `fct_relevel(f, "a")` | `["a", *(lvl for lvl in levels if lvl != "a")]` |
+| `droplevels(f)` | `s.unique().drop_nulls().sort().cast(pl.String)` |
+
+: Data-dependent levels {.striped}
+
+**`fct_infreq()`**: levels by frequency, ties broken by name:
+
+```{python}
+carrier_infreq = pl.Enum(
+    flights_df["carrier"].value_counts()
+    .sort(["count", "carrier"], descending=[True, False])["carrier"]
+)
+flights_df.group_by(pl.col("carrier").cast(carrier_infreq)).len().sort("carrier").head(4)
+```
+
+Sorting by the Enum column now means sorting by frequency.
+
+**`fct_reorder()`, `fct_rev()`, `fct_relevel()`**: each line below is a level
+list for `pl.Enum()`:
+
+```{python}
+species_levels = penguins_df["species"].unique().sort().to_list()
+{
+    "fct_reorder(island, body_mass_g)": penguins_df.group_by("island")
+    .agg(pl.col("body_mass_g").median())
+    .sort("body_mass_g", "island")["island"].to_list(),
+    "fct_rev(carrier_infreq), first 3": carrier_infreq.categories.reverse().head(3).to_list(),
+    "fct_relevel(species, 'Gentoo')": ["Gentoo", *(s for s in species_levels if s != "Gentoo")],
+}
+```
+
+`fct_reorder()`'s `.desc = TRUE` is `descending=True`, and `.fun` is whichever
+aggregation you put in `agg()`.
+
+**`fct_recode()` and `fct_collapse()`**: `replace_strict()` with an Enum
+`return_dtype` renames values and sets the new levels in one step. A value
+missing from the mapping raises (pass `default=` for a catch-all):
+
+```{python}
+flights_df.select(
+    "origin",
+    origin_name=pl.col("origin").replace_strict(
+        {"EWR": "Newark", "JFK": "JFK", "LGA": "LaGuardia"},
+        return_dtype=pl.Enum(["JFK", "LaGuardia", "Newark"]),
+    ),
+    state=pl.col("origin").replace_strict(
+        {"EWR": "NJ", "JFK": "NY", "LGA": "NY"}, return_dtype=pl.Enum(["NY", "NJ"])
+    ),
+).unique().sort("origin_name")
+```
+
+On a Categorical, plain `replace()` works, because any string is a valid
+value. On an Enum, `replace()` raises for a value that is not a level.
+
+**`fct_lump_n()`, `fct_lump_prop()`, `fct_lump_min()`**: a count per value via
+a window, then `when/then/otherwise`:
+
+```{python}
+carrier_top5 = (
+    flights_df.group_by("carrier").len()
+    .filter(pl.col("len").rank("min", descending=True) <= 5)   # ties.method = "min"
+    .sort("len", descending=True)["carrier"]
+)
+n_carrier = pl.len().over("carrier")
+other = pl.lit("Other")
+
+carrier_df_lumped = flights_df.select(
+    lump_n=pl.when(pl.col("carrier").is_in(carrier_top5.to_list())).then("carrier").otherwise(other),
+    lump_prop=pl.when(n_carrier / pl.len() > 0.15).then("carrier").otherwise(other),
+    lump_min=pl.when(n_carrier >= 40_000).then("carrier").otherwise(other),
+).cast(pl.Enum([*carrier_top5, "Other"]))   # frequency order, "Other" last
+
+{c: carrier_df_lumped[c].unique().sort().to_list() for c in carrier_df_lumped.columns}
+```
+
+`fct_lump_prop()` lumps levels at or below the proportion, hence `>`;
+`fct_lump_min()` keeps levels with at least `min` rows, hence `>=`. On a
+String column the result is String, and on a Categorical it stays
+Categorical. On an Enum, `otherwise("Other")` raises unless `"Other"` is
+already a level, so cast to String first.
+
+**`fct_na_value_to_level()`**: an Enum level can't be null (`pl.Enum()` raises
+on one), so name the missing level, add it, then fill:
+
+```{python}
+sex_enum_na = pl.Enum(["female", "male", "(Missing)"])
+penguins_df.group_by(sex=pl.col("sex").fill_null("(Missing)").cast(sex_enum_na)).len().sort("sex")
+```
+
+**Empty levels** (≈ `count(f, .drop = FALSE)`). [Grouping](../transform/group-agg.qmd#sec-grp-keys)
+returns only levels that occur. To report the others with a count of zero,
+build a frame of all the levels and left-join the counts onto it:
+
+```{python}
+species_enum = pl.Enum(["Adelie", "Chinstrap", "Gentoo"])
+torgersen_df = penguins_df.filter(pl.col("island") == "Torgersen").with_columns(
+    pl.col("species").cast(species_enum)
+)
+species_levels_df = species_enum.categories.cast(species_enum).to_frame("species")
+
+species_levels_df.join(
+    torgersen_df.group_by("species").len(), on="species", how="left"
+).with_columns(pl.col("len").fill_null(0)).sort("species")
+```
+
+For two factors, cross-join their level frames first
+([`complete()`](../transform/reshape.qmd#sec-rs-complete)). The key dtypes
+must match, which is why the level frame is cast to the same Enum.
+
+**`droplevels()`**: rebuild the Enum from the values present. Sorting an
+Enum keeps the old level order, and `pl.Enum()` needs a String Series, not an
+Enum one:
+
+```{python}
+torgersen_df.schema["species"], pl.Enum(torgersen_df["species"].unique().drop_nulls().sort().cast(pl.String))
+```
+
+**Validate levels at the boundary.** An Enum in `schema_overrides=` makes
+`read_csv()` (and `scan_csv()`) reject unknown values while parsing, a cheap
+data check:
+
+```{python}
+#| error: true
+pl.read_csv(io.StringIO("id,size\n1,lo\n2,huge\n"), schema_overrides={"size": size_enum})
+```
+
+## See also {#sec-cat-see-also}
+
+- Cheatsheet:
+  [Factors (forcats) & Binning](../overview/polars-cheatsheet.qmd#sec-cs-factors)
+- Before: [Data Model & Dtypes](../core/data-model.qmd#sec-dm-physical)
+  (physical codes) · [Selectors](../core/selectors.qmd) (`cs.enum()`) ·
+  [Joins](../transform/joins.qmd#sec-join-dtypes) (key dtypes) ·
+  [Sort rows](../transform/verbs.qmd#sec-verb-sort)
+- Next: [Missing Values](missing.qmd#sec-na-implicit) (empty groups as
+  implicit missing rows) · [Strings & Regex](strings.qmd) ·
+  [Logicals, Numbers & Conditionals](logic-numbers.qmd) (`bin_*`, `replace_strict()`)
+- Polars user guide:
+  [Categorical data and enums](https://docs.pola.rs/user-guide/expressions/categorical-data-and-enums/)
+- Python API: [`Enum`](https://docs.pola.rs/api/python/stable/reference/api/polars.datatypes.Enum.html) ·
+  [`Categorical`](https://docs.pola.rs/api/python/stable/reference/api/polars.datatypes.Categorical.html) ·
+  [`Categories`](https://docs.pola.rs/api/python/stable/reference/api/polars.datatypes.Categories.html) ·
+  [`cat` namespace](https://docs.pola.rs/api/python/stable/reference/expressions/categories.html)
+- R side: R4DS 2e, [Factors](https://r4ds.hadley.nz/factors.html);
+  [forcats](https://forcats.tidyverse.org)

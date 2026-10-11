@@ -1,0 +1,547 @@
+---
+title: "Performance & Anti-patterns"
+subtitle: "≈ “vectorise, don't loop” · data.table habits"
+jupyter: python3
+---
+
+Polars is fast when Rust does the work and slow whenever Python does it a
+row, a group or a piece at a time. This chapter measures the habits that
+cross into Python, what chunks and sorted flags change, where the threads
+go, and how to time a query now that `profile()` is gone. Linked, not
+repeated: the UDF ladder
+([Programming](../program/programming.qmd#sec-prog-udf)), the optimizer and a
+measured eager-vs-lazy query ([Lazy API](lazy.qmd#sec-lazy-measured)),
+memory and dtype shrinking ([Data Model](../core/data-model.qmd#sec-dm-recipes)),
+String vs Enum speed ([Categorical](../types/categorical.qmd#sec-cat-why)).
+
+## In tidyverse {#sec-perf-tidyverse}
+
+```r
+# Loop vs vectorised: rows, groups, pieces
+for (i in seq_len(nrow(flights))) flights$mph[i] <- flights$distance[i] / flights$air_time[i] * 60
+flights |> mutate(mph = distance / air_time * 60)
+flights |> group_split(tailnum) |>
+  map(\(d) summarise(d, delay = mean(dep_delay, na.rm = TRUE), .by = tailnum)) |> list_rbind()
+flights |> summarise(delay = mean(dep_delay, na.rm = TRUE), .by = tailnum)
+out <- NULL; for (f in files) out <- rbind(out, read.csv(f))   # copies everything, every time
+out <- files |> map(read_csv) |> list_rbind()
+
+# data.table habits
+DT[, mph := distance / air_time * 60]; setkey(DT, time_hour); setDTthreads(4)
+DT[, mean(dep_delay), by = tailnum, verbose = TRUE]   # GForce: internal C per group
+```
+
+The folklore carries over, for a different reason. An R loop is slow because
+each iteration is interpreted and `df$x[i] <-` copies on modify; a Polars loop
+is slow because each iteration leaves Rust, builds Python objects, and comes
+back. data.table habits map like this:
+
+| data.table | Polars | Note |
+|---|---|---|
+| `DT[, x := f(y)]` (by reference) | `df.with_columns(x=...)` | a new frame, but untouched columns are shared ([Data Model](../core/data-model.qmd#sec-dm-sharing)) |
+| `setkey(DT, t)` | `df.sort("t")` | sorts and sets the sorted flag (@sec-perf-sorted) |
+| `setattr(DT, "sorted", "t")` | `pl.col("t").set_sorted()` | a promise, not a check (@sec-perf-sorted-lie) |
+| `rbindlist(list_of_dts)` | `pl.concat(list_of_dfs)` | once, not in a loop (@sec-perf-grow) |
+| GForce `mean(x)` by group | a native expression in `agg()` | a Python function in `agg()` is the slow path |
+| `setDTthreads(n)` | `POLARS_MAX_THREADS=n`, before import | @sec-perf-threads |
+| `verbose = TRUE` | `pl.Config.set_verbose()`, `POLARS_LOG_METRICS=1` | @sec-perf-profile |
+| `bench::mark()` | `%timeit`, or `race()` below | @sec-perf-bench |
+
+: data.table habits → Polars {.striped}
+
+## Mental model {#sec-perf-model}
+
+```text
+ native expression     Python: build the Expr once ──► Rust: one compiled pass over n rows
+                       cost ≈ n × nanoseconds
+
+ Python loop           Python ──┬── iteration 1 ──► Rust ──► Python objects
+                                ├── iteration 2 ──► Rust ──► Python objects
+                                └── … × k   (k = rows, groups or pieces)
+                       cost ≈ k × microseconds, plus one Python object per value
+
+ a Series in memory    [chunk 0][chunk 1][chunk 2] …   a list of Arrow buffers
+                       concat / vstack append pointers (no copy); rechunk() copies into one
+```
+
+- **Count crossings, not rows.** A loop over 3 groups is harmless; over 4,044
+  groups it is not; over 336,776 rows it never is.
+- **Chunks are cheap to make and costly to iterate.** A handful is normal;
+  thousands slow every element-wise step that follows.
+- **Metadata lets Polars skip work, and Polars believes it.** A sorted flag
+  turns `sort()` and `max()` into lookups, and a false one into wrong answers.
+
+## Mechanics {#sec-perf-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import tempfile
+import timeit
+from collections.abc import Callable
+
+import pandas as pd
+import polars as pl
+from polars.testing import assert_frame_equal
+from pl_notes import datasets
+
+flights_df = datasets.flights()
+```
+
+### Measuring fairly {#sec-perf-bench}
+
+```{python}
+def bench(f: Callable[[], object], runs: int = 5) -> float:
+    """Median wall time of f() in ms, after one untimed warm-up call."""
+    f()
+    return statistics.median(timeit.repeat(f, number=1, repeat=runs)) * 1000
+
+
+def race(candidates: dict[str, Callable[[], object]], runs: int = 5) -> pl.DataFrame:
+    """≈ bench::mark() without the result check: median ms, and ratio to the fastest."""
+    ms = {name: bench(f, runs) for name, f in candidates.items()}
+    return pl.DataFrame({"approach": list(ms), "ms": list(ms.values())}).with_columns(
+        pl.col("ms").round(2), x_fastest=(pl.col("ms") / pl.col("ms").min()).round(1)
+    )
+```
+
+`timeit` uses `time.perf_counter()` and pauses garbage collection while it
+times. The warm-up absorbs one-off costs (the first run was often the
+slowest in probes); the median ignores a run that lost a core to another
+process. Assert that candidates agree before timing them. Numbers below come
+from an Apple M3 Pro with 11 threads and change between renders; the prose
+states only ratios that held in repeated runs. Interactively, `%timeit`.
+
+### Row loops {#sec-perf-rows}
+
+Miles per hour for every flight, as one expression and as three loops:
+
+```{python}
+def mph(distance: int, air_time: float | None) -> float | None:
+    """The scalar version, for the loops."""
+    return None if air_time is None else distance / air_time * 60
+
+
+mph_native = flights_df.select(mph=pl.col("distance") / pl.col("air_time") * 60)["mph"]
+two_cols_df = flights_df.select("distance", "air_time")
+assert pl.Series("mph", [mph(*r) for r in two_cols_df.iter_rows()]).equals(mph_native)
+
+race({
+    "native expression": lambda: flights_df.select(pl.col("distance") / pl.col("air_time") * 60),
+    "iter_rows(named=True)": lambda: [
+        mph(r["distance"], r["air_time"]) for r in flights_df.iter_rows(named=True)
+    ],
+    "select(2 cols).iter_rows()": lambda: [mph(*r) for r in two_cols_df.iter_rows()],
+    "zip(Series.to_list())": lambda: [
+        mph(d, a) for d, a in zip(flights_df["distance"].to_list(), flights_df["air_time"].to_list())
+    ],
+}, runs=3)
+```
+
+The leanest loop is tens of times slower, named rows over a thousand. A
+loop pays per row *and per column it is handed*: `iter_rows(named=True)`
+builds a 19-key dict per flight (plain `iter_rows()`, a 19-value tuple,
+measured ~1.5× faster). Selecting the two columns first cut it ten-fold, to
+still more than a hundred times the expression; a `df.row(i)` loop was ~2×
+slower again in probes. When the loop *is* the point (an API call or a
+database insert per row, as in [Reading & Writing](io.qmd#sec-io-db)),
+select the columns and iterate tuples. To compute a column, there is no fast
+loop.
+
+### Per-group loops {#sec-perf-groups}
+
+Mean delay per group, by iterating a `group_by()` (≈ `group_split() |>
+map()`) and natively, for keys with 3, 105 and 4,044 groups:
+
+```{python}
+def loop_mean(key: str) -> pl.DataFrame:
+    """One Python iteration per group."""
+    return pl.DataFrame(
+        [{key: k, "avg_delay": sub_df["dep_delay"].mean()} for (k,), sub_df in flights_df.group_by(key)]
+    )
+
+
+def native_mean(key: str) -> pl.DataFrame:
+    return flights_df.group_by(key).agg(avg_delay=pl.col("dep_delay").mean())
+
+
+assert_frame_equal(loop_mean("tailnum"), native_mean("tailnum"), check_row_order=False)
+pl.DataFrame([
+    {"key": key, "groups": flights_df[key].n_unique(),
+     "x_native": bench(lambda: loop_mean(key), 3) / bench(lambda: native_mean(key), 3)}
+    for key in ["origin", "dest", "tailnum"]
+]).with_columns(pl.col("x_native").round(0))
+```
+
+The native time barely moves with the group count; the loop pays tens of
+microseconds per group (gather a sub-frame, call Python, build a dict): a
+few times native for 3 groups, tens of times for 4,044. Per-group mutates
+behaved alike in probes: `partition_by()` + loop + `pl.concat()`, and
+`map_groups()` slower still, against one `.over()`. Loop only when each
+group must leave Polars (a model fit, a file);
+[Grouping](../transform/group-agg.qmd#sec-grp-escape) has native forms of
+common per-group functions.
+
+### Growing a frame {#sec-perf-grow}
+
+1,000 pieces, as from 1,000 files or API pages, stacked three ways:
+
+```{python}
+piece_dfs = [flights_df.slice(i * 337, 337) for i in range(1_000)]
+
+
+def concat_in_loop(dfs: list[pl.DataFrame]) -> pl.DataFrame:   # ≈ out <- rbind(out, piece)
+    out_df = dfs[0]
+    for piece_df in dfs[1:]:
+        out_df = pl.concat([out_df, piece_df])
+    return out_df
+
+
+def extend_in_loop(dfs: list[pl.DataFrame]) -> pl.DataFrame:   # appends into out_df's buffers
+    out_df = dfs[0].clone()
+    for piece_df in dfs[1:]:
+        out_df.extend(piece_df)
+    return out_df
+
+
+assert concat_in_loop(piece_dfs).equals(extend_in_loop(piece_dfs))
+race({
+    "concat(list) once": lambda: pl.concat(piece_dfs),
+    "extend() in loop": lambda: extend_in_loop(piece_dfs),
+    "concat() in loop, 500": lambda: concat_in_loop(piece_dfs[:500]),
+    "concat() in loop, 1,000": lambda: concat_in_loop(piece_dfs),
+}, runs=3)
+```
+
+`pl.concat()` copies no data (`rechunk=False` is the 2.0 default): each
+result column is the list of its inputs' chunks. In a loop, call *i* copies
+*i* chunk pointers per column, so the cost is quadratic in pieces, not rows:
+doubling the pieces more than tripled the time, and 1,000 cost about a
+hundred times one `pl.concat()`. `vstack()` in a loop measured the same;
+`rechunk=True` inside the loop also copies the data (R's `rbind()` loop) and
+was ~2.5× slower again. `extend()` stays linear with one chunk; its
+docstring's advice, `vstack()` then one `rechunk()`, measured far slower for
+1,000 small appends.
+
+### Chunks and `rechunk()` {#sec-perf-chunks}
+
+```{python}
+flights_df_chunked = pl.concat(piece_dfs)
+flights_df_rechunked = flights_df_chunked.rechunk()
+chunk_ops = {
+    "filter": lambda df: df.filter(pl.col("dep_delay") > 60),
+    "with_columns": lambda df: df.with_columns(mph=pl.col("distance") / pl.col("air_time") * 60),
+    "group_by().agg()": lambda df: df.group_by("dest").agg(pl.col("dep_delay").mean()),
+    "sort": lambda df: df.sort("dep_delay"),
+}
+print("chunks in:", flights_df_chunked.n_chunks(), "vs", flights_df_rechunked.n_chunks(),
+      "| a lazy collect():", flights_df.lazy().filter(pl.col("dep_delay") > 0).collect().n_chunks())
+pl.DataFrame([
+    {"operation": name,
+     "x_slower": bench(lambda: op(flights_df_chunked)) / bench(lambda: op(flights_df_rechunked)),
+     "chunks_out": op(flights_df_chunked).n_chunks()}
+    for name, op in chunk_ops.items()
+]).with_columns(pl.col("x_slower").round(1))
+```
+
+Element-wise steps run chunk by chunk and pass the chunking on, so the
+overhead recurs at every later step; sorting and grouping write fresh
+buffers. In probes, 11 chunks cost at most 1.5×, 100 about 2×, 10,000
+60–160× on element-wise steps, and `rechunk()` (one copy) cost less than one
+filter on the 1,000-chunk frame. A few chunks are normal in 2.0: `collect()`
+returns one per engine batch (11 here), `read_csv()` gave 68 for the flights
+CSV, `read_parquet()` one per row group. Rechunk once after assembling many
+pieces, not after every read (2.0 removed the readers' `rechunk=`). One
+chunk and no nulls is also what zero-copy `to_numpy(allow_copy=False)` needs
+([Data Model](../core/data-model.qmd#sec-dm-sharing)).
+
+### Many `with_columns()` calls {#sec-perf-with-columns}
+
+Merging every new column into one call is common advice. Eagerly, four
+calls instead of one cost 1.2–1.4× in probes: columns computed earlier are
+shared, not copied, so a call costs overhead and the parallelism across
+expressions, nothing more. Lazily, the `cluster_with_columns` optimization
+merges calls that don't depend on each other:
+
+```{python}
+print(
+    flights_df.lazy()
+    .with_columns(mph=pl.col("distance") / pl.col("air_time") * 60)
+    .with_columns(gain=pl.col("dep_delay") - pl.col("arr_delay"))
+    .with_columns(fast=pl.col("mph") > 500)
+    .explain()
+)
+```
+
+`mph` and `gain` share one `WITH_COLUMNS`; `fast` reads `mph`, so it stays a
+separate step. Split steps for readability (`.pipe()` functions are plain
+calls); in a lazy pipeline the optimizer merges what it can.
+
+### Sorted flags {#sec-perf-sorted}
+
+Every Series carries `flags`. `sort()` sets one; arithmetic, even `+ 0`,
+clears it. Same values, with and without the flag:
+
+```{python}
+delay_sorted = flights_df["dep_delay"].drop_nulls().sort()
+delay_plain = delay_sorted + 0          # same values, flag dropped
+print(delay_sorted.flags, delay_plain.flags)
+
+flag_ops = {"sort()": pl.Series.sort, "max()": pl.Series.max,
+            "median()": pl.Series.median, "is_sorted()": pl.Series.is_sorted}
+{name: round(bench(lambda: op(delay_plain), 9) / bench(lambda: op(delay_sorted), 9))
+ for name, op in flag_ops.items()}
+```
+
+| Sets the flag | Keeps it | Drops it |
+|---|---|---|
+| `sort()`, `with_row_index()`, `pl.int_range()`, `set_sorted()` | `filter()`, `head()`, `drop_nulls()` | arithmetic, `cast()`, `fill_null()`, `pl.concat()`, a Parquet / IPC / CSV round trip |
+
+: Verified on Polars 2.0.0 {.striped}
+
+With the flag these become lookups: `sort()` returns its input, `max()` the
+last value, `median()` the middle one. The saving is small in absolute terms,
+since sorting data already in order is fast anyway (~6× faster than shuffled
+in probes). In probes a flag also let `filter()` binary-search (8× on 10
+million sorted integers, nothing on `flights`) and sped up joins (~2×);
+`group_by()` gained nothing, and lost 2× with a million distinct keys.
+`join_asof()`, `group_by_dynamic()` and `rolling()` check sortedness from the
+data (a fast O(n) scan), so a flag only skips the check. `setkey()` is
+`sort()`; prefer it to setting the flag by hand (@sec-perf-sorted-lie).
+
+### Threads {#sec-perf-threads}
+
+`pl.thread_pool_size()` is 11 here: one pool per process, sized to the
+cores. `POLARS_MAX_THREADS` sets it, but only before `import polars`;
+setting it later changes nothing (checked). So compare in fresh
+interpreters:
+
+```{python}
+THREAD_PROBE = """
+import json, statistics, timeit
+import polars as pl
+from pl_notes import datasets
+flights_df = datasets.flights()
+route = pl.col("origin") + "-" + pl.col("dest")
+ops = {
+    "sort": lambda: flights_df.sort("dep_delay", "arr_delay"),
+    "group_by().agg()": lambda: flights_df.group_by("tailnum").agg(pl.col("dep_delay").mean()),
+    "one string expression, eager": lambda: flights_df.select(route),
+    "same expression, lazy": lambda: flights_df.lazy().select(route).collect(),
+}
+print(json.dumps({k: statistics.median(timeit.repeat(f, number=1, repeat=8)) for k, f in ops.items()}))
+"""
+
+
+def probe_secs(extra_env: dict[str, str]) -> dict[str, float]:
+    """Run THREAD_PROBE in a fresh interpreter, which reads POLARS_MAX_THREADS at import."""
+    probe = subprocess.run([sys.executable, "-c", THREAD_PROBE], env=os.environ | extra_env,
+                           capture_output=True, text=True)
+    return json.loads(probe.stdout)
+
+
+one_thread, all_threads = probe_secs({"POLARS_MAX_THREADS": "1"}), probe_secs({})
+{name: round(one_thread[name] / all_threads[name], 1) for name in one_thread}   # speed-up from 11 threads
+```
+
+Sorting and grouping scale, far from 11×. The eager string expression did
+not speed up at all: the eager context evaluated it as one task over the
+column (several expressions in one context do run in parallel: six sped up
+~2.4× in a probe). The streaming engine split the same column into batches
+across threads. For one heavy element-wise step (strings, parsing, regex) on
+a big column, `df.lazy()…collect()` is the parallel version.
+
+Python-level parallelism adds nothing: queries in a Python thread pool share
+the one Polars pool, and `map_elements()` holds the GIL (four threads gave no
+gain in a probe). Run independent queries with `pl.collect_all()`
+([Lazy API](lazy.qmd#sec-lazy-recipes)). With `multiprocessing`, use
+`get_context("spawn")`: a `fork`ed child inherits Polars' locks without its
+threads and can deadlock. `spawn` is the default on macOS and Windows; Linux
+defaulted to `fork` before Python 3.14.
+
+### Profiling a query {#sec-perf-profile}
+
+```{python}
+#| error: true
+flights_df.lazy().profile()
+```
+
+| Tool | Shows | Runs the query? |
+|---|---|---|
+| `lf.explain()` | the optimized logical plan ([Lazy API](lazy.qmd#sec-lazy-explain)) | no |
+| `lf.show_graph(plan_stage="physical", raw_output=True)` | the streaming operators as DOT text; the legend marks in-memory fallbacks | no |
+| `pl.Config.set_verbose(True)`, `POLARS_VERBOSE=1` | engine decisions, scan details, scheduler state, on stderr | yes: a log firehose |
+| `POLARS_LOG_METRICS=1` | per streaming operator: CPU time, rows in and out; per query: wall and CPU time | yes |
+| `cProfile`, `%prun` | time spent in Python (UDFs, loops) | yes |
+
+: Profiling tools in 2.0 {.striped}
+
+`POLARS_LOG_METRICS` is not in the Python API docs (found in the 2.0
+runtime); it is read per query and writes long lines to stderr. This helper
+captures and parses them:
+
+```{python}
+def node_times(lf: pl.LazyFrame) -> pl.DataFrame:
+    """CPU time and row counts per streaming operator for one collect()."""
+    with tempfile.TemporaryFile("w+") as log:
+        saved_stderr = os.dup(2)
+        os.dup2(log.fileno(), 2)                 # the engine writes to file descriptor 2
+        os.environ["POLARS_LOG_METRICS"] = "1"
+        try:
+            lf.collect(engine="streaming")
+        finally:
+            del os.environ["POLARS_LOG_METRICS"]
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
+        log.seek(0)
+        text = log.read()
+    print(*re.findall(r"^Streaming query took .*?\)", text, re.M), sep="\n")
+    to_ms = {"ns": 1e-6, "µs": 1e-3, "ms": 1.0, "s": 1e3}
+    node_line = r"^(\S+): tot\(([\d.]+)(ns|µs|ms|s)\).*?recv\(row=(\d+).*?sent\(row=(\d+)"
+    return pl.DataFrame(
+        [(node, float(t) * to_ms[unit], int(n_in), int(n_out))
+         for node, t, unit, n_in, n_out in re.findall(node_line, text, re.M)],
+        schema=["node", "cpu_ms", "rows_in", "rows_out"], orient="row",
+    ).sort("cpu_ms", descending=True)
+
+
+node_times(
+    flights_df.lazy().filter(pl.col("origin") == "JFK")
+    .group_by("tailnum").agg(pl.col("dep_delay").mean()).sort("tailnum")
+)
+```
+
+`cpu_ms` sums over threads: the nodes add up to the query's CPU time, not
+its wall time. Operators run concurrently, which is why `profile()`'s
+per-node wall clock was dropped. Read it as *where the CPU went* and *how
+many rows each step saw*. The filter is a node here because the source is in
+memory; on a Parquet scan with the filter pushed down there is no filter
+node and the scan sends only the 111,279 JFK rows, while a `map_batches()`
+before the filter made it send all 336,776 (a probe). Work the streaming
+engine can't do shows as one `in-memory-map` node. The format is internal
+and may change.
+
+## Where it bites {#sec-perf-gotchas}
+
+| Expectation | Polars 2.0 |
+|---|---|
+| a loop over groups is always slow | its cost is per group: 3 are fine, thousands are not (@sec-perf-groups) |
+| `pl.concat()` copies nothing, so a loop of them is cheap | each call copies the chunk lists: quadratic in pieces (@sec-perf-grow) |
+| chunk count is an internal detail | thousands of chunks slow every later element-wise step (@sec-perf-chunks) |
+| `read_csv(..., rechunk=True)` from older tutorials | `ArgumentRemovedError`; call `.rechunk()` on the result |
+| `set_sorted()` is a hint | a promise; break it and results are silently wrong (@sec-perf-sorted-lie) |
+| a sorted column stays flagged after a file round trip | Parquet, IPC and CSV readers return it unflagged |
+| `to_pandas()` / `from_pandas()` just work | both need `pyarrow`; the NumPy route changes dtypes (@sec-perf-pandas) |
+| an eager step uses every core | one element-wise expression runs as one task (@sec-perf-threads) |
+| `POLARS_MAX_THREADS` can change in a running session | read once, at import |
+| `lf.profile()` | removed in 2.0; use `POLARS_LOG_METRICS` (@sec-perf-profile) |
+
+: The differences at a glance {.striped}
+
+### A false `set_sorted()` is silently wrong {#sec-perf-sorted-lie}
+
+`set_sorted()` checks nothing. Tell Polars `[3, 1, 2]` is sorted and every
+operation that reads the flag trusts it:
+
+```{python}
+lie = pl.Series("x", [3, 1, 2]).set_sorted()
+right_df = pl.DataFrame({"t": [6, 5, 4, 3, 2, 1], "v": ["f", "e", "d", "c", "b", "a"]})
+{
+    "sort()": lie.sort().to_list(),                                     # truth: [1, 2, 3]
+    "min(), max()": (lie.min(), lie.max()),                             # (1, 3)
+    "median()": lie.median(),                                           # 2.0
+    "filter(x > 1)": lie.filter(lie > 1).to_list(),                     # [3, 2]
+    "unique() of [1, 2, 1]": pl.Series([1, 2, 1]).set_sorted().unique().to_list(),   # [1, 2]
+    "join_asof(t = 3)": pl.DataFrame({"t": [3]})
+    .join_asof(right_df.with_columns(pl.col("t").set_sorted()), on="t")["v"].to_list(),   # ["c"]
+}
+```
+
+Every answer is wrong, with no warning. A grouped `agg()` splits one key
+into several groups; `rolling()` and `group_by_dynamic()` crash with a Rust
+`PanicException` instead of their "not sorted" error. data.table's
+`setattr(DT, "sorted", "x")` is the same trap. `sort()` is cheap on ordered
+data (@sec-perf-sorted), sets the flag, and is never wrong.
+
+### pandas round-trips {#sec-perf-pandas}
+
+Both directions go through Arrow; this book's environment has no `pyarrow`:
+
+```{python}
+#| error: true
+flights_df.to_pandas()
+```
+
+`pl.from_pandas()` raises too unless every column is NumPy-backed, and the
+default string dtype of pandas 3 is not. The NumPy route works, at a price:
+
+```{python}
+times_df = flights_df.select("dep_time", "time_hour")
+times_pd = pd.DataFrame({c: times_df[c].to_numpy() for c in times_df.columns})
+times_df_back = pl.from_pandas(times_pd)
+
+print(times_pd.dtypes.astype(str).to_dict())
+pl.concat([times_df, times_df_back.select(pl.all().name.suffix("_back"))], how="horizontal").head(1)
+```
+
+An integer column with nulls becomes `float64` with `NaN` (`nan_to_null=True`
+restores the nulls on the way back, not the dtype), and the time zone is
+dropped, leaving UTC wall-clock times. Even then, a round trip for one
+grouped mean was ~6–8× slower than `.over()` in probes. Convert once, at the
+edge of the pipeline, with `pyarrow` installed.
+
+## Recipes {#sec-perf-recipes}
+
+**Anti-pattern → replacement**, across the book:
+
+| Anti-pattern | Replacement | Details |
+|---|---|---|
+| `for row in df.iter_rows()` to compute a column | one expression | @sec-perf-rows |
+| `map_elements(lambda …)` | a native expression; `map_batches()` for a vectorised function | [Programming](../program/programming.qmd#sec-prog-udf) |
+| `map_elements()` on a List column | `list.*`, `list.eval()` | [Nested Data](../types/nested.qmd#sec-nest-map-elements) |
+| `for key, sub_df in df.group_by(...)`, `map_groups()` | `group_by().agg()`, `.over()` | @sec-perf-groups, [Grouping](../transform/group-agg.qmd#sec-grp-escape) |
+| `pl.concat([out_df, piece_df])` in a loop | a list, then one `pl.concat()` | @sec-perf-grow |
+| thousands of chunks | `rechunk()` once | @sec-perf-chunks |
+| `read_*()`, then filter and select | `scan_*()` … `collect()` | [Lazy API](lazy.qmd#sec-lazy-measured) |
+| `collect()` in the middle of a pipeline | one plan, one `collect()` | [Lazy API](lazy.qmd#sec-lazy-when) |
+| several `collect()`s on one input | `pl.collect_all()` | [Lazy API](lazy.qmd#sec-lazy-recipes) |
+| `String` keys sorted, grouped or joined repeatedly | `Enum` / `Categorical`, cast once | [Categorical](../types/categorical.qmd#sec-cat-why) |
+| default `Int64` / `Float64` on a big frame | `shrink_dtype()`, narrower casts | [Data Model](../core/data-model.qmd#sec-dm-recipes) |
+| `maintain_order=True` everywhere, by habit | only where order is observed | [Grouping](../transform/group-agg.qmd#sec-grp-order), [Verbs](../transform/verbs.qmd#sec-verb-ties) |
+| `set_sorted()` to skip a sort | `sort()` | @sec-perf-sorted-lie |
+| `to_pandas()` mid-pipeline | stay in Polars; convert once at the edge | @sec-perf-pandas |
+| one heavy element-wise expression, eager | `df.lazy()…collect()` | @sec-perf-threads |
+| a Python thread or process pool around queries | `pl.collect_all()`; `spawn` if you must | @sec-perf-threads |
+
+: Anti-patterns and replacements {.striped}
+
+**Find the slow step of a query**: `node_times(lf)` (@sec-perf-profile). After
+a file scan, a filter node that receives far more rows than it keeps is a
+pushdown that didn't happen, often a UDF in the way
+([Lazy API](lazy.qmd#sec-lazy-optimizations)).
+
+## See also {#sec-perf-see-also}
+
+- Cheatsheet: [Gotchas at a Glance](../overview/polars-cheatsheet.qmd#sec-cs-gotchas) ·
+  [Lazy API](../overview/polars-cheatsheet.qmd#sec-cs-lazy)
+- Related: [Lazy API](lazy.qmd) (optimizer, streaming, a measured query) ·
+  [Programming](../program/programming.qmd#sec-prog-udf) (the UDF ladder, timed) ·
+  [Data Model](../core/data-model.qmd) (shared columns, memory) ·
+  [Categorical](../types/categorical.qmd#sec-cat-why) (String vs Enum speed)
+- Polars user guide: [Multiprocessing](https://docs.pola.rs/user-guide/misc/multiprocessing/) ·
+  [Coming from pandas](https://docs.pola.rs/user-guide/migration/pandas/)
+- Python API: [`DataFrame.iter_rows`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.iter_rows.html) ·
+  [`DataFrame.rechunk`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.rechunk.html) ·
+  [`Series.set_sorted`](https://docs.pola.rs/api/python/stable/reference/series/api/polars.Series.set_sorted.html) ·
+  [`thread_pool_size`](https://docs.pola.rs/api/python/stable/reference/api/polars.thread_pool_size.html)
+- R side: *Advanced R*, [Improving performance](https://adv-r.hadley.nz/perf-improve.html) ·
+  `vignette("datatable-benchmarking", package = "data.table")` · `?bench::mark`

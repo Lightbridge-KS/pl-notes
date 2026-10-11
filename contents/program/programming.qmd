@@ -1,0 +1,696 @@
+---
+title: "Programming with Polars"
+subtitle: "≈ rlang tidy eval · R4DS functions & iteration · purrr"
+jupyter: python3
+---
+
+dplyr needs a second language, tidy eval, before you can write a function
+over columns. Polars needs none: a column reference is an ordinary Python
+value, so ordinary functions compose. This chapter covers expression
+factories and frame functions, reductions across columns, namespaces, the UDF
+ladder, iteration and testing. The tidy-eval translation table is in the
+[cheatsheet](../overview/polars-cheatsheet.qmd#sec-cs-programming);
+expressions as values are in
+[Expressions & Contexts](../core/expressions.qmd#sec-expr-values).
+
+## In tidyverse {#sec-prog-tidyverse}
+
+```r
+library(tidyverse)
+library(palmerpenguins)
+
+# Vector function (R4DS 25.2): vector in, vector out
+z_score <- function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+
+# Data frame function (R4DS 25.3): column *code* forwarded with {{ }}
+grouped_mean <- function(df, group_var, mean_var) {
+  df |>
+    summarise("{{ mean_var }}_mean" := mean({{ mean_var }}, na.rm = TRUE),
+              .by = {{ group_var }})
+}
+penguins |> grouped_mean(species, body_mass_g)
+
+# Iteration (R4DS 26) and purrr
+paths |> set_names(basename) |> map(read_csv) |> list_rbind(names_to = "file")
+penguins |> mutate(total_mm = reduce(pick(ends_with("_mm")), `+`))
+
+# Testing
+testthat::expect_equal(grouped_mean(df, g, x), expected_df)
+```
+
+Inside `grouped_mean()`, a bare `mean_var` would mean a column literally
+called `mean_var`. `{{ }}` (`enquo()` + `!!`) forwards the caller's
+*unevaluated code* into the data mask, and `:=` builds the output name. Both
+exist because in R a column reference is code.
+
+## Mental model {#sec-prog-model}
+
+```text
+ R: a column reference is CODE                Polars: a column reference is a VALUE
+ ─────────────────────────────                ─────────────────────────────────────
+ f(df, body_mass_g)                           f(df, "body_mass_g")  or  f(df, pl.col("body_mass_g") / 1000)
+        │ a promise, never evaluated                 │ an ordinary str / pl.Expr object
+        ▼                                            ▼
+ {{ x }} captures and re-injects the code     passed along like any other argument
+        ▼                                            ▼
+ evaluated inside the data mask               evaluated later by a context (select, agg, over, …)
+```
+
+R4DS 2e sorts functions by what goes in and out. The split carries over,
+except that a vector function becomes one that *builds* an expression.
+
+| R4DS 2e | In → out | Polars | Called from |
+|---|---|---|---|
+| vector function (`z_score(x)`) | vector → vector | **expression factory**: `str | Expr` → `Expr` | any context: `select`, `with_columns`, `agg`, `.over()` |
+| summary function (`cv(x)`) | vector → scalar | an expression factory that aggregates | `agg`, `select`, `.over()` |
+| data frame function | df → df | **frame function**: `DataFrame`/`LazyFrame` → same type | `.pipe(f, ...)` |
+| plot function | df → ggplot | out of scope here | — |
+
+: Three kinds of function {.striped}
+
+## Mechanics {#sec-prog-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import functools
+import math
+import operator
+import time
+from collections.abc import Sequence
+from typing import TypeVar
+
+import numpy as np
+import polars as pl
+import polars.selectors as cs
+from pl_notes import datasets
+
+penguins_df = datasets.penguins()
+flights_df = datasets.flights()
+
+ColumnLike = str | pl.Expr      # a name, an expression, or a selector (Selector subclasses Expr)
+Frame = TypeVar("Frame", pl.DataFrame, pl.LazyFrame)
+```
+
+### Expression factories {#sec-prog-factories}
+
+The cheatsheet's `zscore(col: str)` takes only a name. A composable factory
+also accepts an expression or selector, names outputs so selectors survive,
+and takes the grouping as a parameter.
+
+```{python}
+def zscore(x: ColumnLike, by: str | Sequence[str] | None = None) -> pl.Expr:
+    """Standardise x (a name, expression or selector), within groups if `by` is given."""
+    e = _as_expr(x)
+    z = (e - e.mean()) / e.std()
+    return (z.over(by) if by else z).name.suffix("_z")
+
+
+def _as_expr(x: ColumnLike) -> pl.Expr:
+    """A name becomes pl.col(name); an expression or selector passes through."""
+    return pl.col(x) if isinstance(x, str) else x
+
+
+penguins_df.select(
+    "species",
+    zscore("body_mass_g"),                          # a name
+    zscore(pl.col("flipper_length_mm").log()),      # an expression
+    zscore(cs.starts_with("bill_"), by="species"),  # a selector, within species
+).head(3)
+```
+
+- **`_as_expr()` is all the tidy eval there is.** `pl.col()` raises
+  `TypeError` on an `Expr`, so normalise once at the boundary. A `Selector`
+  subclasses `Expr`, so `str | pl.Expr` admits it. (Polars' richer aliases,
+  such as `IntoExpr`, are in the private `polars._typing`.)
+- **`.name.suffix()`, not `.alias(f"{x}_z")`.** `.alias()` needs a string and
+  gives every output of a selector one name
+  ([Selectors](../core/selectors.qmd#sec-sel-name-trap)).
+- **Grouping is a parameter.** `.over(by)` makes it a grouped `mutate()`;
+  inside `group_by().agg()` the plain expression is already per group.
+- **`Expr.pipe()` chains factories**: `pl.col("x").log().pipe(zscore, by="g")`.
+
+**Several outputs.** Return a dict, splatted with `**`, or a list, passed as
+the *only* positional argument or unpacked with `*` (@sec-prog-list-trap):
+
+```{python}
+def describe(x: str) -> dict[str, pl.Expr]:
+    """n, mean and sd of one column, keyed by output name."""
+    e = pl.col(x)
+    return {f"{x}_n": e.count(), f"{x}_mean": e.mean(), f"{x}_sd": e.std()}
+
+penguins_df.group_by("species").agg(**describe("body_mass_g")).sort("species")
+```
+
+**Keep factories pure**: build only, no data, no side effects. A statistic
+computed in Python is frozen into the expression and ignores the groups it
+later runs in:
+
+```{python}
+overall_mean = penguins_df["body_mass_g"].mean()       # a float, fixed now
+
+penguins_df.group_by("species").agg(
+    baked=(pl.col("body_mass_g") > overall_mean).mean(),                  # vs all penguins
+    pure=(pl.col("body_mass_g") > pl.col("body_mass_g").mean()).mean(),   # vs own species
+).sort("species")
+```
+
+### Frame functions {#sec-prog-frames}
+
+A frame function takes a frame first and returns one, so `.pipe(f, *args,
+**kwargs)` chains it like `|>`. With the `Frame` TypeVar, one function serves
+both frame types:
+
+```{python}
+def add_speed(df: Frame, distance: str = "distance", air_time: str = "air_time") -> Frame:
+    """Add mph from distance (miles) and air_time (minutes)."""
+    _require(df, distance, air_time)
+    return df.with_columns(mph=pl.col(distance) / pl.col(air_time) * 60)
+
+
+def _require(df: pl.DataFrame | pl.LazyFrame, *cols: str) -> None:
+    """Raise now, not at collect(), naming the columns that are missing."""
+    schema = df.collect_schema()
+    if missing := [c for c in cols if c not in schema]:
+        raise ValueError(f"missing column(s) {missing}")
+
+
+flights_df.pipe(add_speed).select("carrier", "distance", "air_time", "mph").head(2)
+```
+
+`collect_schema()` resolves a lazy plan without reading data. Without
+`_require()`, a missing column surfaces only at `collect()`
+([Lazy API](../scale/lazy.qmd#sec-lazy-errors)); with it, at the call:
+
+```{python}
+#| error: true
+flights_df.lazy().select("distance").pipe(add_speed)   # no collect() needed
+```
+
+**TypeVar or union?** Checked with mypy (not run in this book):
+
+| Annotation | `add_speed(df)` is typed as | `df.height` in the body |
+|---|---|---|
+| `pl.DataFrame | pl.LazyFrame` | the union, so `x: pl.DataFrame = add_speed(df)` fails | flagged: `Item "LazyFrame" … has no attribute "height"` |
+| `TypeVar("Frame", pl.DataFrame, pl.LazyFrame)` | the input's own type | flagged: `"LazyFrame" has no attribute "height"` |
+
+: Typing a function for both frame types {.striped}
+
+Both catch eager-only methods; only the TypeVar keeps `DataFrame` in →
+`DataFrame` out. Polars uses the same TypeVar internally (`FrameType`).
+`LazyFrame.pipe_with_schema(f)` (unstable) defers the call to plan time:
+`f(lf, schema)` gets the schema as a plain `dict`, and its errors surface at
+`collect()`.
+
+### Reductions across columns {#sec-prog-reduce}
+
+`purrr::reduce()` over columns has two Polars forms: `functools.reduce()`
+folds expressions into one native tree *while building*; `pl.reduce()` /
+`pl.fold()` call your function on whole `Series` *while running*. Check the
+`*_horizontal` family first ([Selectors](../core/selectors.qmd#sec-sel-rowwise)).
+There is no `prod_horizontal()`, so take a product of pass rates:
+
+```{python}
+yield_df = pl.DataFrame({
+    "site": ["A", "B", "C"],
+    "pass_scan": [0.99, 0.95, 0.97],
+    "pass_recon": [0.98, 0.99, 0.90],
+    "pass_report": [0.97, 0.96, 0.99],
+})
+stage_cols = cs.expand_selector(yield_df, cs.starts_with("pass_"))
+
+yield_exprs = {
+    "build_time": functools.reduce(operator.mul, [pl.col(c) for c in stage_cols]),
+    "run_time": pl.reduce(operator.mul, cs.starts_with("pass_")),
+}
+yield_df.with_columns(**yield_exprs)
+```
+
+Same numbers, different plans:
+
+```{python}
+print(yield_df.lazy().select(**yield_exprs).explain())
+```
+
+| | `functools.reduce(op, exprs)` | `pl.reduce(fn, exprs)` / `pl.fold(acc, fn, exprs)` |
+|---|---|---|
+| Runs | in Python, while building | in the engine, while running |
+| `fn` receives | two `Expr`s | two `Series` (k − 1 calls for k columns) |
+| Columns | must be known: names, or `cs.expand_selector()` | a selector, resolved at plan time |
+| Optimizer | sees every operation | one opaque node |
+| Output dtype | supertype of the inputs | `reduce`: from the inputs; `fold`: from the accumulator (@sec-prog-fold-dtype) |
+
+: Build-time vs run-time reduce {.striped}
+
+`purrr::accumulate()` is `pl.cum_reduce()` / `pl.cum_fold()`, a struct with
+a field per step (`pl.cum_sum_horizontal()` for `+`). `reduce(dfs,
+full_join)` over frames is `pl.concat(how="align")`
+([Joins](../transform/joins.qmd#sec-join-concat)).
+
+### Custom namespaces {#sec-prog-namespaces}
+
+A namespace adds your verbs after a dot, beside `.str` and `.dt`. The
+decorator puts a descriptor on `pl.Expr`; `pl.col("hu").ct` wraps the
+expression in your class, whose methods return new expressions:
+
+```{python}
+@pl.api.register_expr_namespace("ct")
+class CTNamespace:
+    """CT helpers on Hounsfield-unit expressions: pl.col("hu").ct.<method>()."""
+
+    def __init__(self, expr: pl.Expr) -> None:
+        self._expr = expr
+
+    def window(self, level: float, width: float) -> pl.Expr:
+        """Grey level in [0, 1] for a display window (linear, simplified)."""
+        return ((self._expr - (level - width / 2)) / width).clip(0, 1)
+
+
+hu_df = pl.DataFrame({
+    "roi": ["air", "lung", "fat", "water", "liver", "bone"],
+    "hu": [-1000, -850, -100, 0, 60, 700],
+})
+hu_df.with_columns(
+    soft_tissue=pl.col("hu").ct.window(level=40, width=400),
+    lung=pl.col("hu").ct.window(level=-600, width=1500),
+)
+```
+
+Frame namespaces work the same way; stack both decorators for both frame
+types:
+
+```{python}
+@pl.api.register_dataframe_namespace("qc")
+@pl.api.register_lazyframe_namespace("qc")
+class QCNamespace:
+    """Validation verbs that return the frame, so they chain."""
+
+    def __init__(self, df: pl.DataFrame | pl.LazyFrame) -> None:
+        self._df = df
+
+    def require(self, *cols: str) -> pl.DataFrame | pl.LazyFrame:
+        _require(self._df, *cols)
+        return self._df
+
+
+flights_df.lazy().qc.require("origin", "dest").group_by("origin").len().sort("origin").collect()
+```
+
+Registration monkey-patches a class you don't own, for the whole process:
+
+| You register | Verified result in 2.0 |
+|---|---|
+| a Polars namespace (`str`, `dt`, `list`, `name`, `meta`, `struct`, `plot`, …) | `AttributeError: cannot override reserved namespace` |
+| an existing method name (`mean`) | `AttributeError: cannot override Expr.mean …` |
+| a custom name again (a re-run cell, or two packages that both chose `ct`) | `UserWarning`, then the last registration wins for every caller |
+| on `Expr` | also on selectors, but not on `Series` (`register_series_namespace()`) |
+| anything | invisible to type checkers: mypy reports `"Expr" has no attribute "ct"` |
+
+: Namespace registration caveats {.striped}
+
+```{python}
+#| error: true
+pl.api.register_expr_namespace("str")(CTNamespace)
+```
+
+```{python}
+pl.api.register_expr_namespace("ct")(CTNamespace);   # what re-running the cell above does
+```
+
+An R package's verbs are functions, scoped by imports and `pkg::`, with a
+masking message on a clash. A namespace is one global attribute per name.
+Inside a project prefer plain functions and `.pipe()`: typed, explicitly
+imported, easy to test. For a team package, keep the namespace a thin doorway
+onto such functions (as `qc.require()` is onto `_require()`), under a
+specific name.
+
+### The UDF ladder {#sec-prog-udf}
+
+When no native expression exists, climb only as far as needed:
+
+| Rung | Polars | Your function sees | Optimizer | R analogue |
+|---|---|---|---|---|
+| 1. native | `pl.col("x").log1p()` | — | sees everything | vectorised base R |
+| 2. whole column | `.map_batches(f, return_dtype=...)` | one `Series` (per group in `agg()` / `.over()`) | opaque; `is_elementwise=True` lets filters pass | `mutate(y = f(x))` |
+| 3. per value | `.map_elements(f, return_dtype=...)` | one Python scalar per row; nulls skipped | opaque | `map_dbl(x, f)`, `rowwise()` |
+| 4. compiled plugin | `polars.plugins.register_plugin_function(...)` | native Rust, no GIL | what you declare | Rcpp |
+
+: The UDF ladder {.striped}
+
+Rung 3 reads your function's bytecode and, when it can, names the rewrite:
+
+```{python}
+log1p_elements = pl.col("distance").map_elements(math.log1p, return_dtype=pl.Float64)
+```
+
+The same function at each rung, on 336,776 flights:
+
+```{python}
+def best_ms(expr: pl.Expr, n: int = 5) -> float:
+    """Best-of-n wall time in ms to evaluate expr on flights_df."""
+    times = []
+    for _ in range(n):
+        start = time.perf_counter()
+        flights_df.select(expr)
+        times.append(time.perf_counter() - start)
+    return min(times) * 1000
+
+rungs = {
+    "native": pl.col("distance").log1p(),
+    "map_batches(np.log1p)": pl.col("distance").map_batches(np.log1p, return_dtype=pl.Float64),
+    "map_elements(math.log1p)": log1p_elements,
+}
+rung_ms = {name: best_ms(expr) for name, expr in rungs.items()}
+pl.DataFrame({"rung": list(rung_ms), "ms": list(rung_ms.values())}).with_columns(
+    pl.col("ms").round(1), x_native=(pl.col("ms") / rung_ms["native"]).round(1)
+)
+```
+
+Timings are machine-dependent; the shape is not. `map_batches()` with a
+vectorised function costs about the same as native; `map_elements()` is a
+Python loop, more than an order of magnitude slower. `map_batches()` blocks
+predicate pushdown unless `is_elementwise=True` ([Lazy API](../scale/lazy.qmd)),
+and a NumPy ufunc on an expression (`np.log1p(pl.col("distance"))`) is a
+`map_batches()` in disguise: the plan shows `python_udf()`.
+
+**Rung 4** is a Rust crate built with `pyo3-polars` and `maturin`;
+`register_plugin_function(plugin_path=, function_name=, args=,
+is_elementwise=)` wraps a function into an `Expr` that runs natively and is
+optimized as its flags allow (`polars-xdt` and `polars-ds` are built this
+way). The cost: a Rust toolchain and a build per platform.
+
+### Iteration {#sec-prog-iteration}
+
+R4DS's *Iteration* chapter, mapped:
+
+| R4DS 2e | Polars |
+|---|---|
+| `across()` | selectors + expression factories ([Selectors](../core/selectors.qmd#sec-sel-across)) |
+| `map(paths, read_csv) |> list_rbind(names_to = "file")` | a glob with `include_file_paths=`; per-file work: `pl.concat(pl.scan_csv(p).with_columns(...) for p in paths)` |
+| `map()` over parameters that change an expression | a list of expressions in **one** context |
+| `map()` over parameters that change the pipeline | a list of `LazyFrame`s + `pl.collect_all()` |
+| `group_split()` + `map()` | `group_by().agg()` first; `partition_by()` / `map_groups()` only to leave Polars ([Grouping](../transform/group-agg.qmd#sec-grp-escape)) |
+| `walk2(dfs, paths, write_csv)` | `sink_parquet(pl.PartitionBy(...))` ([Lazy API](../scale/lazy.qmd#sec-lazy-recipes)), or a loop |
+| `possibly()` | `try` / `except` inside the loop |
+
+: R4DS iteration → Polars {.striped}
+
+**Many files.** Write one CSV per species (a loop: each piece leaves Polars),
+then read them back as one frame:
+
+```{python}
+import tempfile
+from pathlib import Path
+
+tmp = tempfile.TemporaryDirectory()
+species_dir = Path(tmp.name)
+for (species,), species_df in penguins_df.partition_by("species", as_dict=True).items():
+    species_df.drop("species").write_csv(species_dir / f"{species.lower()}.csv")
+
+penguins_df_reread = (
+    pl.scan_csv(species_dir / "*.csv", include_file_paths="path")
+    .with_columns(species=pl.col("path").str.extract(r"(\w+)\.csv$"))
+    .drop("path")
+    .collect()
+)
+penguins_df_reread.group_by("species").len().sort("species")
+```
+
+Files whose schemas differ need `pl.concat(how="diagonal_relaxed")`
+([Joins](../transform/joins.qmd#sec-join-concat)); globs and formats are in
+[Reading & Writing](../scale/io.qmd).
+
+**Many parameters, one pass.** A parameter that only changes an expression
+becomes a comprehension inside one context:
+
+```{python}
+flights_df.group_by("origin").agg(
+    (pl.col("dep_delay") > t).mean().alias(f"late_{t}") for t in [15, 60, 180]
+).sort("origin")
+```
+
+**Many pipelines.** A parameter that changes the query's shape gets one
+`LazyFrame` per value, ≈ `map(keys, \(k) summarise(flights, ..., .by =
+all_of(k)))`. `collect_all()` runs them together over a shared scan
+([Lazy API](../scale/lazy.qmd#sec-lazy-recipes)):
+
+```{python}
+flights_lf = flights_df.lazy()
+keys = ["origin", "carrier", "month"]
+delay_by_lfs = [
+    flights_lf.group_by(k).agg(avg_delay=pl.col("dep_delay").mean()).sort(k) for k in keys
+]
+delay_by = dict(zip(keys, pl.collect_all(delay_by_lfs)))
+{k: df.shape for k, df in delay_by.items()}
+```
+
+### Testing {#sec-prog-testing}
+
+`polars.testing` is Polars' `expect_equal()`. Tests are plain functions that
+pytest collects as they are; here they are just called:
+
+```{python}
+from polars.testing import assert_frame_equal, assert_series_equal
+
+def test_add_speed() -> None:
+    trips_df = pl.DataFrame({"distance": [600, 300], "air_time": [60, 30]})
+    expected_df = trips_df.with_columns(mph=pl.Series([600.0, 600.0]))
+    assert_frame_equal(add_speed(trips_df), expected_df)
+    assert_frame_equal(add_speed(trips_df.lazy()), expected_df.lazy())   # both frame types
+
+def test_zscore() -> None:
+    z = pl.DataFrame({"x": [1.0, 2.0, 3.0]}).select(zscore("x")).to_series()
+    assert_series_equal(z, pl.Series("x_z", [-1.0, 0.0, 1.0]))
+
+test_add_speed()
+test_zscore()
+```
+
+Test a factory on a tiny frame, a frame function on whole frames. A failure
+names the difference:
+
+```{python}
+#| error: true
+assert_frame_equal(pl.DataFrame({"n": [1, 2]}), pl.DataFrame({"n": [1.0, 2.0]}))
+```
+
+| `assert_frame_equal()` argument | Default | testthat 3e `expect_equal()` |
+|---|---|---|
+| `check_dtypes` | `True`: `Int64` ≠ `Float64` | integer and double compare by value |
+| `check_row_order` / `check_column_order` | `True` / `True` | order matters |
+| `check_exact` | `False`: floats compared with tolerance | tolerance by default |
+| `rel_tol` / `abs_tol` | `1e-5` / `1e-8` | `testthat_tolerance()` ≈ `1.5e-8` |
+| inputs | two `DataFrame`s or two `LazyFrame`s; a mix raises | — |
+
+: Defaults, verified in 2.0 {.striped}
+
+Null equals null and `NaN` equals `NaN`. `assert_schema_equal()` compares
+schemas only; `polars.testing.parametric` (property-based) needs
+`hypothesis`, not installed here.
+
+## Where it bites {#sec-prog-gotchas}
+
+| Expectation | Polars 2.0 |
+|---|---|
+| a factory call computes something | it returns an `Expr`: no data until a context runs it |
+| a list of expressions can go anywhere | it's flattened only as the sole positional argument (@sec-prog-list-trap) |
+| two calls of one factory make two columns | same input, same output name: `DuplicateError` |
+| a lambda built in a loop keeps its loop value | it sees the last value (@sec-prog-late-binding) |
+| `def f(xs=[])` gets a fresh list per call | the default is created once and shared |
+| `pl.fold(pl.lit(0), ...)` adds floats | the result takes the accumulator's `Int32` (@sec-prog-fold-dtype) |
+| a namespace is local to your code | it's global; a re-registration wins for every caller, with only a `UserWarning` |
+| a UDF runs once, on your data | it also runs on dummy data unless `return_dtype=` is set (@sec-prog-udf-traps) |
+| `return_dtype=pl.Float64` converts ints | a Python `int` raises `SchemaError` |
+| `is_elementwise=True` is a speed hint | it's a promise; break it and streaming results are wrong |
+
+: The differences at a glance {.striped}
+
+### A list is flattened only when alone {#sec-prog-list-trap}
+
+Alone, a list is a list of columns. Next to another positional argument, a
+list of strings becomes a **list literal**, silently:
+
+```{python}
+penguins_df.select(["species", "island"], "year").head(2)
+```
+
+A list of expressions there raises `TypeError: … Nested object types`.
+Unpack with `*`: `select(*factory(...), "year")`. Keyword arguments beside a
+list are fine.
+
+### Same input, same name {#sec-prog-name-trap}
+
+Output names come from the input column
+([Naming](../core/expressions.qmd#sec-expr-naming)), so one factory called
+twice on one column collides:
+
+```{python}
+#| error: true
+penguins_df.select(zscore("body_mass_g"), zscore("body_mass_g", by="species"))
+```
+
+Rename one at the call site with `.alias()`, or make the suffix a parameter.
+
+### Late binding and shared defaults {#sec-prog-late-binding}
+
+Closures look variables up when called, not when created. An expression
+captures *values* as it is built; a UDF lambda in the same loop does not:
+
+```{python}
+x_df = pl.DataFrame({"x": [1, 2]})
+x_df.select(
+    [(pl.col("x") * k).alias(f"native_{k}") for k in (1, 2, 3)]
+    + [pl.col("x").map_batches(lambda s: s * k, return_dtype=pl.Int64).alias(f"udf_{k}")
+       for k in (1, 2, 3)]
+)
+```
+
+Every `udf_*` used `k = 3`; bind it with `lambda s, k=k: s * k`. The mirror
+image is a mutable default, created once when `def` runs and then shared:
+
+```{python}
+#| error: true
+def with_count(exprs: list[pl.Expr] = []) -> list[pl.Expr]:
+    exprs.append(pl.len())
+    return exprs
+
+x_df.select(with_count())   # ["len"]
+x_df.select(with_count())   # ["len", "len"]
+```
+
+Use a tuple default, or `None` and build the list inside.
+
+### `fold()` takes its dtype from the accumulator {#sec-prog-fold-dtype}
+
+`pl.lit(0)` is `Int32`, and `pl.fold()` casts its result to the
+accumulator's dtype: floats are truncated, `Int32` overflow becomes null, no
+warning:
+
+```{python}
+penguins_df.select(
+    folded=pl.fold(pl.lit(0), operator.add, cs.ends_with("_mm")),
+    horizontal=pl.sum_horizontal(cs.ends_with("_mm")),
+).head(2)
+```
+
+Prefer `pl.reduce()` (dtype from the inputs) or the `*_horizontal` function;
+otherwise start from `pl.lit(0.0)` or pass `return_dtype=`.
+
+### UDFs run on dummy data and return strictly {#sec-prog-udf-traps}
+
+Without `return_dtype=`, Polars infers the output dtype by **calling your
+function on dummy data** while planning, eager frames included:
+
+```{python}
+batch_sizes: list[int] = []
+
+def log1p_logged(s: pl.Series) -> pl.Series:
+    """log1p with a side effect: record each batch's length."""
+    batch_sizes.append(s.len())
+    return s.log1p()
+
+flights_df.select(pl.col("distance").map_batches(log1p_logged))
+flights_df.select(pl.col("distance").map_batches(log1p_logged, return_dtype=pl.Float64))
+batch_sizes
+```
+
+The extra 2-row call is harmless here, not in a function that calls a model,
+an API or a logger. Keep UDFs pure and set `return_dtype=` (`pl.self_dtype()`
+= same as input); Polars doesn't warn when it is missing.
+
+Results are built strictly, like `pl.Series([1, 2.5])`: every returned value
+must already have the dtype. An `int` from one branch fails a `Float64`:
+
+```{python}
+#| error: true
+x_df.select(pl.col("x").map_elements(lambda v: v * 1.5 if v > 1 else v, return_dtype=pl.Float64))
+```
+
+Without `return_dtype=` it fails on the first float instead. Return
+`float(...)` on every branch.
+
+**`is_elementwise=True` is a contract.** It lets filters pass the UDF and
+the streaming engine feed it chunks, so a function of the whole batch goes
+silently wrong:
+
+```{python}
+def centre(s: pl.Series) -> pl.Series:
+    """Not element-wise: every value depends on the batch mean."""
+    return s - s.mean()
+
+centred = pl.col("dep_delay").map_batches(centre, return_dtype=pl.Float64, is_elementwise=True)
+truth = flights_df.select(pl.col("dep_delay") - pl.col("dep_delay").mean()).to_series()
+{
+    engine: round((flights_lf.select(centred).collect(engine=engine).to_series() - truth).abs().max(), 2)
+    for engine in ["in-memory", "streaming"]
+}
+```
+
+Streaming centred each chunk on its own mean: off by up to 13 minutes here
+(chunking is machine-dependent), with no error.
+
+## Recipes {#sec-prog-recipes}
+
+**A reusable `summarise_by()`** (≈ `summarise(across(cols, list(n = ..., mean
+= ...)), .by = by)`): any `ColumnLike`, either frame type, sorted output:
+
+```{python}
+STATS = {"n": pl.Expr.count, "mean": pl.Expr.mean, "sd": pl.Expr.std}
+
+def summarise_by(
+    df: Frame, by: str | Sequence[str], cols: ColumnLike, stats: Sequence[str] = ("n", "mean")
+) -> Frame:
+    """One row per group; columns {col}_{stat}, function-major."""
+    x = _as_expr(cols)
+    return df.group_by(by).agg(STATS[s](x).name.suffix(f"_{s}") for s in stats).sort(by)
+
+penguins_df.pipe(summarise_by, "species", cs.starts_with("bill_"))
+```
+
+The default is a tuple, not a list (@sec-prog-late-binding).
+
+**`case_when()` from data** (≈ `case_when(!!!rules)`). Rules as a dict, the
+first match wins: a `when()` per rule, `coalesce()`d:
+
+```{python}
+def case_when(rules: dict[str, pl.Expr], default: str | None = None) -> pl.Expr:
+    """First matching label per row; `default` where nothing matches."""
+    whens = (pl.when(cond).then(pl.lit(label)) for label, cond in rules.items())
+    return pl.coalesce(*whens, pl.lit(default, dtype=pl.String))
+
+delay = pl.col("dep_delay")
+delay_bands = {"early": delay < 0, "on time": delay <= 15, "late": delay <= 60, "very late": delay > 60}
+flights_df.group_by(band=case_when(delay_bands, default="cancelled")).len().sort("band")
+```
+
+Null conditions count as no match, so the 8,255 flights without a departure
+delay fall through to the default. The output is named `literal`, so always
+name it at the call site.
+
+```{python}
+#| include: false
+tmp.cleanup()
+```
+
+## See also {#sec-prog-see-also}
+
+- Cheatsheet:
+  [Programming with Polars](../overview/polars-cheatsheet.qmd#sec-cs-programming) ·
+  [Gotchas at a Glance](../overview/polars-cheatsheet.qmd#sec-cs-gotchas)
+- Related: [Expressions & Contexts](../core/expressions.qmd) (expressions as values, naming) ·
+  [Selectors](../core/selectors.qmd) (`across()`, row-wise) ·
+  [Grouping & Aggregation](../transform/group-agg.qmd) (`partition_by()`, `map_groups()`) ·
+  [Lazy API](../scale/lazy.qmd) (UDFs and pushdown, `collect_all()`) ·
+  [Reading & Writing](../scale/io.qmd)
+- Polars user guide:
+  [User-defined Python functions](https://docs.pola.rs/user-guide/expressions/user-defined-python-functions/) ·
+  [Folds](https://docs.pola.rs/user-guide/expressions/folds/) ·
+  [Expression plugins](https://docs.pola.rs/user-guide/plugins/expr_plugins/)
+- Python API:
+  [`polars.api` namespaces](https://docs.pola.rs/api/python/stable/reference/api.html) ·
+  [`polars.testing`](https://docs.pola.rs/api/python/stable/reference/testing.html)
+- R: R4DS 2e chapters *Functions* and *Iteration*; `vignette("programming",
+  package = "dplyr")`; `?purrr::reduce`

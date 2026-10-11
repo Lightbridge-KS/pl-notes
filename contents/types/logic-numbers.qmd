@@ -1,0 +1,642 @@
+---
+title: "Logicals, Numbers & Conditionals"
+subtitle: "≈ R4DS logical vectors & numbers · `if_else()` · `case_when()` · `cut()`"
+jupyter: python3
+---
+
+Comparisons, arithmetic, rounding, recoding and binning: the column-level
+vocabulary of R4DS's *Logical vectors* and *Numbers* chapters. Polars agrees
+with R on more of the arithmetic than you might expect: `//` and `%` follow
+R's sign rules, and `round()` rounds half to even. The differences are about
+dtypes. When a value meets a column of another dtype, R coerces upward, while
+Polars coerces up, casts *down* to the column's dtype, or refuses, depending
+on the function. Polars 2.0 also replaced `cut()` and `qcut()` with three
+`bin_*` functions.
+
+## In tidyverse {#sec-num-tidyverse}
+
+```r
+library(tidyverse)
+library(nycflights13)
+
+near(sqrt(2)^2, 2)                              # TRUE, where == gives FALSE
+flights |> filter(between(dep_time, 600, 2000), month %in% c(11, 12))
+flights |> summarise(prop_delayed = mean(dep_delay > 0, na.rm = TRUE))
+
+flights |> mutate(hour = sched_dep_time %/% 100, minute = sched_dep_time %% 100)
+round(c(0.5, 1.5, 2.5))                         # 0 2 2: half to even
+round(123.456, -1); signif(123.456, 2)          # 120 120
+
+flights |> mutate(status = case_when(
+  is.na(arr_delay)     ~ "cancelled",
+  arr_delay < -30      ~ "very early",
+  arr_delay < -15      ~ "early",
+  abs(arr_delay) <= 15 ~ "on time",
+  arr_delay < 60       ~ "late",
+  .default             = "very late"
+))
+case_match(x, "a" ~ "A", .default = x)          # recode some values
+cut(x, breaks = c(0, 5, 10, 15, 20))            # (0,5] (5,10] ...; outside → NA
+ntile(x, 4)
+```
+
+R has one coercion direction: up the ladder logical → integer → double →
+character. `c()` and `==` climb it silently; `if_else()` and `case_when()`
+refuse to.
+
+## Mental model {#sec-num-model}
+
+```text
+ A value meets a column of another dtype (x is Int64 here). Polars does one of three things:
+
+ UP to a supertype   x == 1.5,  x > 1.5,  x + 1.5,  x.is_between(1.5, 2.5)   exact, as in R
+                     when(c).then(1).otherwise(0.5)                           Float64
+                     when(c).then(pl.lit("a")).otherwise(0)                   String: 0 → "0"  (!)
+ DOWN to x's dtype   x.replace({1.5: 0})        key 1.5 → 1, so it matches 1  (!)
+                     x.replace({1: 1.5})        value 1.5 → 1                 (!)
+                     x.clip(0.5, 9.5)           bounds → 0 and 9              (!)
+ REFUSE              x == "1",  x.is_in([1.5]),  x ** -1                      error
+```
+
+The rows marked (!) are silent. R never casts down: `pmax(x, 0.5)` returns
+doubles, and `if_else(c, "a", 0)` is an error. **Rule:** give literals the
+column's dtype, or cast the column first.
+
+## Mechanics {#sec-num-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import math
+from decimal import Decimal
+
+import polars as pl
+from pl_notes import datasets
+
+flights_df = datasets.flights()
+penguins_df = datasets.penguins()
+```
+
+### Comparisons {#sec-num-compare}
+
+The right-hand side of a comparison can be a literal, another column, or an
+aggregation, which is broadcast:
+
+```{python}
+dep = pl.col("dep_delay")
+flights_df.select(
+    "dep_time", "dep_delay", "arr_delay",
+    daytime=pl.col("dep_time").is_between(600, 2000, closed="none"),  # R4DS: > 600 & < 2000
+    made_up_time=pl.col("arr_delay") < dep,                           # column vs column
+    worse_than_avg=dep > dep.mean(),                                  # vs an aggregate
+).slice(120_000, 3)
+```
+
+| `closed=` | Interval | R |
+|---|---|---|
+| `"both"` (default) | `[lo, hi]` | `between(x, lo, hi)` |
+| `"left"` | `[lo, hi)` | `x >= lo & x < hi` |
+| `"right"` | `(lo, hi]` | `x > lo & x <= hi` |
+| `"none"` | `(lo, hi)` | `x > lo & x < hi` |
+
+: `is_between()` bounds; swapped bounds give all `false`, as in dplyr {.striped}
+
+The bounds may be expressions, so a string bound is a **column name**, not a
+value ([the string rule](../core/expressions.qmd#sec-expr-literals)):
+
+```{python}
+#| error: true
+flights_df.filter(pl.col("carrier").is_between("AA", "B6"))
+```
+
+`pl.lit("AA")` fixes it. A string compared with a numeric column
+(`pl.col("month") == "11"`) raises, where R's `month == "11"` coerces. Since
+2.0, `is_in()` also wants the list's dtype to match the column's:
+`is_in([11.0, 12.0])` on the Int64 `month` raises "'is_in' cannot check for
+Int64 values in List(Float64) data". `&`, `|` and `~` are covered in
+[Expressions](../core/expressions.qmd#sec-expr-gotchas); R's `xor(x, y)` is
+`x ^ y`.
+
+#### Floating-point equality {#sec-num-float}
+
+R4DS's example, plus a value near zero:
+
+```{python}
+float_df = pl.DataFrame({
+    "x": [1 / 49 * 49, math.sqrt(2) ** 2, 1e-12],
+    "target": [1.0, 2.0, 0.0],
+})
+float_df.with_columns(
+    equal=pl.col("x") == pl.col("target"),
+    is_close=pl.col("x").is_close("target"),                        # rel_tol=1e-9
+    near=pl.col("x").is_close("target", abs_tol=1.5e-8, rel_tol=0),  # ≈ dplyr::near()
+)
+```
+
+`is_close()` mirrors Python's `math.isclose()`: the default is a *relative*
+tolerance, so nothing but 0 is close to 0. `dplyr::near()` is an absolute
+test, `abs(x - y) < sqrt(.Machine$double.eps)` (about 1.5e-8); pass `abs_tol=`
+and `rel_tol=0` to get it. `nans_equal=True` makes `NaN` close to `NaN`. The
+string `"target"` is a column here too.
+
+#### Boolean summaries {#sec-num-bool}
+
+R4DS's per-day summaries translate one for one, with `na.rm = TRUE` already
+the default:
+
+```{python}
+flights_df.group_by("month", "day").agg(
+    all_delayed=(pl.col("dep_delay") <= 60).all(),
+    any_long_delay=(pl.col("arr_delay") >= 300).any(),
+    prop_delayed=(pl.col("dep_delay") > 0).mean(),
+    n_long_delay=(pl.col("arr_delay") >= 300).sum(),
+).sort("month", "day").head(3)
+```
+
+- `sum()` of a Boolean is a count typed `UInt32`, so
+  [subtracting counts wraps](../transform/group-agg.qmd#sec-grp-unsigned).
+  `mean()` is the proportion among non-null rows.
+- `any()` and `all()` skip nulls; R's Kleene version is `ignore_nulls=False`
+  ([Missing Values](missing.qmd#sec-na-any-trap)).
+- Row-wise, `a + b` on two Boolean columns is a `UInt32` count of trues
+  (null if either is null); `pl.sum_horizontal()` skips nulls
+  ([Selectors](../core/selectors.qmd#sec-sel-rowwise)).
+- R4DS's logical subsetting, `mean(arr_delay[arr_delay > 0])`, is `filter()`
+  inside `agg()`: see
+  [Conditional aggregation](../transform/group-agg.qmd#sec-grp-conditional).
+
+### Arithmetic {#sec-num-arith}
+
+`/` always returns a float, as in R. `//` floors, and `%` takes the sign of
+the divisor, exactly like R's `%/%` and `%%` (and Python's own operators):
+
+```{python}
+div_df = pl.DataFrame({"x": [7, -7, 7, -7, 7], "y": [2, 2, -2, -2, 0]})
+div_df.with_columns(
+    div=pl.col("x") / pl.col("y"),
+    floordiv=pl.col("x") // pl.col("y"),
+    mod=pl.col("x") % pl.col("y"),
+    toward_zero=(pl.col("x") / pl.col("y")).truncate(),
+)
+```
+
+```r
+c(7, -7, 7, -7) %/% c(2, 2, -2, -2)   #  3 -4 -4  3
+c(7, -7, 7, -7) %%  c(2, 2, -2, -2)   #  1  1 -1 -1
+7L %/% 0L                             # NA
+```
+
+- `x == y * (x // y) + x % y` holds in both languages.
+- Integer `//` and `%` by zero give null, R's `NA`
+  ([Missing Values](missing.qmd#sec-na-nan)). On floats they give `inf` and
+  `NaN`, as R's doubles do.
+- `truncate()` (≈ `trunc()`) and casting to an integer round toward zero, so
+  they disagree with `//` on negatives: −3 vs −4.
+
+| R | Polars | Output dtype |
+|---|---|---|
+| `log(x)`, `log(x, b)`, `log2(x)`, `log10(x)` | `.log()`, `.log(b)`, `.log(2)`, `.log10()` | Float64 |
+| `log1p(x)`, `exp(x)`, `sqrt(x)` | `.log1p()`, `.exp()`, `.sqrt()` | Float64 |
+| `x^y` | `x ** y`, `.pow(y)` | **integer if both are integers** (@sec-num-pow) |
+| `abs(x)`, `sign(x)` | `.abs()`, `.sign()` | the input's |
+
+: Maths functions; there is no `log2()` or `expm1()` {.striped}
+
+`log(0)` is `-inf`, and the log or square root of a negative number is `NaN`,
+not null ([null vs NaN](missing.qmd#sec-na-nan)).
+
+### Rounding {#sec-num-round}
+
+```{python}
+round_df = pl.DataFrame({"x": [0.5, 1.5, 2.5, -2.5, -1.7]})
+round_df.with_columns(
+    round=pl.col("x").round(),                               # half to even, like R
+    half_away=pl.col("x").round(mode="half_away_from_zero"),
+    floor=pl.col("x").floor(),
+    ceil=pl.col("x").ceil(),
+    truncate=pl.col("x").truncate(),
+)
+```
+
+| R | Polars |
+|---|---|
+| `round(x)`, `round(x, 2)` | `.round()`, `.round(2)`: same half-to-even default |
+| (no base R option) | `.round(mode="half_away_from_zero")` |
+| `signif(x, 2)` | `.round_sig_figs(2)` |
+| `floor(x)`, `ceiling(x)`, `trunc(x)` | `.floor()`, `.ceil()`, `.truncate()` |
+| `round(x, -1)` | `(x / 10).round() * 10`; negative `decimals` raises an `OverflowError` |
+| `round(x / 0.25) * 0.25` | `(x / 0.25).round() * 0.25` |
+| `pmin(pmax(x, lo), hi)` | `.clip(lo, hi)`; one side: `.clip(lower_bound=lo)` |
+
+: Rounding and clamping {.striped}
+
+The docstring also lists `mode="to_zero"`, but 2.0.0 rejects it: use
+`truncate()`. On integers, `round()` and `floor()` are no-ops.
+
+**Ties after the decimal point.** The modes only matter for exact ties, and
+`2.675` is not one: it is stored as 2.67499999…. Polars multiplies by 10^d in
+floating point, rounds that, and divides back (checked against 21,000 random
+values), so whether a printed tie rounds up depends on the product. Python's
+`round()` rounds the stored value:
+
+```{python}
+ties = [0.125, 0.375, 1.115, 2.675, 0.285]
+pl.DataFrame({
+    "x": ties,
+    "stored_as": [str(Decimal(v))[:20] for v in ties],
+    "x_times_100": [repr(v * 100) for v in ties],   # repr: the display would round
+    "polars": pl.Series(ties).round(2),
+    "python": [round(v, 2) for v in ties],
+})
+```
+
+0.125 and 0.375 are exact ties, and both round them to even. For the rest,
+`x * 100` decides: `2.675 * 100` comes out as exactly 267.5, a tie, so it goes
+to the even 268, while `0.285 * 100` falls just short of 28.5. R's `?Round`
+warns about the same problem. When decimal digits must round as written, use
+`Decimal` ([Data Model](../core/data-model.qmd#sec-dm-decimal)): cast from
+strings, `2.675` rounds to `2.68` and `2.665` to `2.66`.
+
+`decimals` is unsigned, so R's "round to tens" needs a divide and multiply:
+
+```{python}
+pl.DataFrame({"x": [123.456, 0.012345]}).with_columns(
+    tens=(pl.col("x") / 10).round() * 10,         # round(x, -1)
+    quarter=(pl.col("x") / 0.25).round() * 0.25,  # nearest 0.25
+    sig2=pl.col("x").round_sig_figs(2),           # signif(x, 2)
+)
+```
+
+`clip()` is `pmin()`/`pmax()` against a scalar or a column. For the larger of
+two columns, use `pl.max_horizontal()`
+([Selectors](../core/selectors.qmd#sec-sel-rowwise)).
+
+```{python}
+clip_df = pl.DataFrame({"x": [-5, 3, 12, None]})
+clip_df.with_columns(
+    clip=pl.col("x").clip(0, 10),             # pmin(pmax(x, 0), 10)
+    at_least_0=pl.col("x").clip(lower_bound=0),
+    fractional=pl.col("x").clip(0.5, 9.5),    # bounds cast to Int64: 0 and 9 (!)
+)
+```
+
+### Conditionals: `when/then` {#sec-num-when}
+
+R4DS's flight status, branch for branch:
+
+```{python}
+arr = pl.col("arr_delay")
+status = (
+    pl.when(arr.is_null()).then(pl.lit("cancelled"))
+    .when(arr < -30).then(pl.lit("very early"))
+    .when(arr < -15).then(pl.lit("early"))
+    .when(arr.abs() <= 15).then(pl.lit("on time"))
+    .when(arr < 60).then(pl.lit("late"))
+    .otherwise(pl.lit("very late"))
+)
+flights_df.group_by(status=status).len().sort("len", descending=True)
+```
+
+- The first true condition wins, and a null condition counts as false, as in
+  `case_when()`. That is why the
+  `is_null()` branch comes first: without it, the 9,430 flights with no
+  `arr_delay` fall through to "very late".
+- Without `otherwise()`, unmatched rows are null, like `case_when()` without
+  `.default`.
+- `pl.when(a, b)` ANDs its conditions, and keyword arguments are equality
+  tests: `pl.when(pl.col("body_mass_g") > 4000, species="Adelie")`.
+- The output is named after the first `then()`, here `literal`
+  ([Naming](../core/expressions.qmd#sec-expr-naming)), and a bare string in
+  `then()` is a column name ([the string rule](../core/expressions.qmd#sec-expr-literals)).
+- All branches are cast to one **supertype**. Where `case_when()` refuses to
+  mix types, Polars converts:
+
+```{python}
+x_df = pl.DataFrame({"x": [-1, 5, 50, None]})
+x_df.with_columns(
+    first_wins=pl.when(pl.col("x") > 0).then(pl.lit("pos"))
+    .when(pl.col("x") > 10).then(pl.lit("big")),                         # 50 → "pos"
+    int_float=pl.when(pl.col("x") > 10).then(1).otherwise(0.5),         # Float64
+    str_int=pl.when(pl.col("x") > 10).then(pl.lit("big")).otherwise(0),  # 0 → "0"
+)
+```
+
+### Recoding: `replace()` and `replace_strict()` {#sec-num-replace}
+
+When each value maps to another value, a mapping is shorter than a `when`
+chain:
+
+| dplyr | Polars | Unmatched values | Output dtype |
+|---|---|---|---|
+| `recode()`; `case_match(x, ..., .default = x)` | `replace(mapping)` | kept | the input's |
+| `case_match(x, ...)` | `replace_strict(mapping, default=None)` | null | from the new values, or `return_dtype=` |
+| `case_match(x, ..., .default = "other")` | `replace_strict(mapping, default="other")` | `"other"`, **nulls included** | same |
+| (none) | `replace_strict(mapping)` | error | same |
+| `left_join(lookup)` | `replace_strict(lookup_keys, lookup_values)` | error | same |
+
+: Recoding values {.striped}
+
+```{python}
+big3 = {"AA": "American", "DL": "Delta", "UA": "United"}
+carrier_df = pl.DataFrame({"carrier": ["AA", "DL", "B6", None]})
+
+carrier_df.with_columns(
+    replace=pl.col("carrier").replace(big3),
+    strict_null=pl.col("carrier").replace_strict(big3, default=None),
+    strict_other=pl.col("carrier").replace_strict(big3, default="other"),
+)
+```
+
+```{python}
+#| error: true
+carrier_df.with_columns(pl.col("carrier").replace_strict(big3))
+```
+
+`B6` raised the error; the null did not, since null maps to null unless
+`default=` is set. Map `None` explicitly (`{None: "unknown"}`) to recode nulls,
+and `replace("", None)` is `na_if()`
+([Missing Values](missing.qmd#sec-na-dropping)).
+
+`replace()` keeps the input dtype, so it cannot turn month numbers into names:
+`replace({1: "Jan"})` on an integer column raises. `replace_strict()` takes its
+dtype from the new values, and `return_dtype=` can make an ordered factor:
+
+```{python}
+month_names = {1: "Jan", 2: "Feb", 3: "Mar"}
+pl.DataFrame({"month": [3, 1, 2]}).with_columns(
+    name=pl.col("month").replace_strict(month_names),
+    level=pl.col("month").replace_strict(
+        month_names, return_dtype=pl.Enum(list(month_names.values()))
+    ),
+)
+```
+
+The *old* values are cast to the column's dtype, silently (@sec-num-cast).
+
+### Binning: `bin_intervals()`, `bin_quantiles()`, `bin_ranks()` {#sec-num-bin}
+
+Polars 2.0 deprecates `cut()` and `qcut()` (they still run, with a
+`DeprecationWarning`) in favour of three functions marked **experimental**:
+
+```text
+                 edges come from              ≈ R                      equal values
+ bin_intervals   you, or n equal-width bins   cut()                    —
+ bin_quantiles   quantiles of the data        cut(x, quantile(x, p))   stay together: sizes vary
+ bin_ranks       position in sorted order     ntile()                  may split: sizes differ by ≤ 1
+```
+
+All three require `labels=`: a list with one label per bin, giving an `Enum`
+(so bins sort in order), or `False` for a 0-based `UInt32` index.
+`include_intervals=True` returns a struct of `bin`, `left` and `right`. Null
+stays null.
+
+```{python}
+bin_df = pl.DataFrame({"x": [0.0, 5.0, 7.5, 10.0, 20.0, None, float("nan")]})
+labels = ["lo", "mid", "hi"]
+bin_df.with_columns(
+    default=pl.col("x").bin_intervals([5, 10], labels=labels),                    # [5, 10)
+    right=pl.col("x").bin_intervals([5, 10], labels=labels, right_closed=True),   # (5, 10]
+    index=pl.col("x").bin_intervals([5, 10], labels=False),
+)
+```
+
+Three differences from `cut()`:
+
+1. **Left-closed by default.** 5 goes to "mid"; `cut()` puts it in the bin
+   below. `right_closed=True` gives `cut()`'s `(a, b]`.
+2. **The edges are interior cut points**, and the outer bins are open-ended,
+   so nothing is out of range: `cut(x, c(-Inf, 5, 10, Inf))` is
+   `bin_intervals([5, 10], ...)`.
+3. **`NaN` lands in the top bin**, because `NaN` sorts above `inf`. `cut()`
+   gives `NA`.
+
+To reproduce `cut(y, breaks = c(0, 5, 10, 15, 20))` with its out-of-range
+`NA`s, null the outside with `when`:
+
+```{python}
+y = pl.col("y")
+pl.DataFrame({"y": [None, -10, 5, 10, 30]}).with_columns(
+    bin=pl.when(y.is_between(0, 20, closed="right")).then(
+        y.bin_intervals(
+            [5, 10, 15], labels=["(0,5]", "(5,10]", "(10,15]", "(15,20]"], right_closed=True
+        )
+    )
+)
+```
+
+Quantile bins and rank bins split the 342 weighed penguins differently:
+
+```{python}
+mass = pl.col("body_mass_g")
+quartiles_df = penguins_df.select(
+    by_quantile=mass.bin_quantiles(4, labels=False),
+    by_rank=mass.bin_ranks(4, labels=False),
+).drop_nulls()
+{c: quartiles_df[c].value_counts().sort(c)["count"].to_list() for c in quartiles_df.columns}
+```
+
+- `bin_quantiles()` puts its edges at `quantile(q, interpolation="lower")`
+  (3,550, 4,050 and 4,750 g). Masses are multiples of 25 g, so 20 penguins
+  weigh exactly an edge value, and left-closed bins put each of them in the
+  upper bin.
+- `bin_ranks()` is `ntile()`: equal sizes, with any remainder going to the
+  earlier bins, and ties broken by row order. `ntile(x, 4)` is
+  `bin_ranks(4, labels=False) + 1`.
+- Edges that come from the data (an integer `intervals`, `bin_quantiles()`,
+  `bin_ranks()`) are computed per group inside `.over()` and `agg()`:
+  `mass.bin_ranks(4, labels=False).over("species")` is
+  `mutate(ntile(body_mass_g, 4), .by = species)`.
+
+### Numeric summaries {#sec-num-summaries}
+
+| R | Polars | Note |
+|---|---|---|
+| `n()`, `sum(!is.na(x))`, `n_distinct(x)` | `pl.len()`, `.count()`, `.n_unique()` | `UInt32`; `n_unique()` counts null as a value, as `n_distinct()` does |
+| `sd(x)`, `var(x)` | `.std()`, `.var()` | `ddof=1` (divide by n − 1), as in R; a single value gives null |
+| `quantile(x, p)` | `.quantile(p, "linear")` | the default is `"nearest"`: see [Grouping](../transform/group-agg.qmd#sec-grp-quantiles) |
+| `IQR(x)` | `.quantile(0.75, "linear") - .quantile(0.25, "linear")` | |
+| `count(x, wt = w)` | `group_by("x").agg(pl.col("w").sum())` | [Counting](../transform/group-agg.qmd#sec-grp-count) |
+
+: Summaries from R4DS *Numbers* {.striped}
+
+Ranks, offsets, cumulative and rolling functions are in
+[Window Functions](../transform/window.qmd).
+
+## Where it bites {#sec-num-gotchas}
+
+| R behaviour | Polars behaviour |
+|---|---|
+| `month == 11 | 12` keeps every row | keeps no rows (@sec-num-precedence) |
+| `month == "11"` coerces | raises; `is_in([11.0])` on an integer column raises too (2.0) |
+| `1L == 1.5` is `FALSE`: compared as doubles | `replace({1.5: …})` truncates the key to 1 and matches it (@sec-num-cast) |
+| `pmax(x, 0.5)` returns doubles | `clip(0.5)` truncates the bound to the column's dtype (@sec-num-cast) |
+| `if_else(c, "a", 0)` is an error | `when/then` casts to a supertype: `0` becomes `"0"` (@sec-num-when) |
+| `x^2` is always a double | `**` on integers stays integer: it wraps, and refuses negative exponents (@sec-num-pow) |
+| `round(x, -1)` rounds to tens | negative `decimals` raises (@sec-num-round) |
+| `cut()` is right-closed; out of range → `NA` | `bin_intervals()` is left-closed and open-ended (@sec-num-bin-edges) |
+
+: The differences at a glance {.striped}
+
+### `month == 11 | 12` matches nothing {#sec-num-precedence}
+
+Python's `|` binds more tightly than `==`, and on two integers it is bitwise
+OR, so the filter below is `month == 15`:
+
+```{python}
+{
+    "month == 11 | 12": flights_df.filter(pl.col("month") == 11 | 12).height,
+    "(month == 11) | (month == 12)": flights_df.filter(
+        (pl.col("month") == 11) | (pl.col("month") == 12)
+    ).height,
+    "is_in([11, 12])": flights_df.filter(pl.col("month").is_in([11, 12])).height,
+}
+```
+
+R parses `month == 11 | 12` as `(month == 11) | 12`, and `12` counts as
+`TRUE`, so every row is kept.
+The two languages fail in opposite directions, and neither warns.
+Parenthesise every comparison, or use `is_in()`.
+
+### Literals are cast to the column's dtype {#sec-num-cast}
+
+`replace()`, `replace_strict()` and `clip()` cast their arguments to the
+column's dtype before using them, and the cast truncates:
+
+```{python}
+pl.DataFrame({"month": [1, 2, 3]}).with_columns(
+    key_1_5=pl.col("month").replace({1.5: 0}),    # 1.5 → 1: matches month 1
+    key_2_9=pl.col("month").replace({2.9: 0}),    # 2.9 → 2
+    value_1_5=pl.col("month").replace({1: 1.5}),  # 1.5 → 1: stays Int64
+    key_str=pl.col("month").replace({"3": 0}),    # "3" → 3
+)
+```
+
+The same values raise in `is_in()` and compare exactly with `==`. Three
+functions, three coercion rules: check the dtype of anything you hand to
+`replace()` or `clip()`.
+
+### Integer powers stay integers {#sec-num-pow}
+
+```{python}
+pl.DataFrame({"n": [10]}).with_columns(
+    squared=pl.col("n") ** 2,    # Int64
+    big=pl.col("n") ** 20,       # wraps silently
+    root=pl.col("n") ** 0.5,     # Float64
+)
+```
+
+`pl.col("n") ** -1` raises, and the message ("conversion from `i32` to `u32`
+failed") is about the exponent: an integer power needs an unsigned one. R's
+`^` always returns a double. Cast first, as in
+`pl.col("n").cast(pl.Float64) ** -1`; silent wrapping is covered in
+[Data Model](../core/data-model.qmd#sec-dm-overflow).
+
+### Bin edges sit on real data {#sec-num-bin-edges}
+
+R4DS's `status` (@sec-num-when) mixes `<` and `<=`. Put the same four edges
+into `bin_intervals()` and compare:
+
+```{python}
+status_bins = arr.bin_intervals(
+    [-30, -15, 15, 60], labels=["very early", "early", "on time", "late", "very late"]
+)
+flights_df.with_columns(status=status, status_bins=status_bins).filter(
+    pl.col("status") != pl.col("status_bins").cast(pl.String)
+).group_by("arr_delay", "status", "status_bins").len()
+```
+
+All 2,470 flights that arrived exactly 15 minutes late move to "late":
+`abs(arr_delay) <= 15` includes 15, and `[-15, 15)` does not. (Cancelled
+flights compare as null and drop out.) `right_closed=True` doesn't help: it
+moves the flights at −30, −15 and 60 instead, about 10,000 of them. Delays are
+whole minutes, so the edge `16` reproduces the chain exactly. Integer data
+lands on edges all the time, so choose the closed side on purpose.
+
+## Recipes {#sec-num-recipes}
+
+**Clock time to minutes since midnight.** `dep_time` writes 05:17 as `517`
+and midnight as `2400`, so finish with `% 1440`:
+
+```{python}
+def hhmm_to_minutes(col: str) -> pl.Expr:
+    """HHMM integer (1530) → minutes since midnight; 2400 → 0."""
+    return (pl.col(col) // 100 * 60 + pl.col(col) % 100) % 1440
+
+flights_df.select("dep_time", dep_min=hhmm_to_minutes("dep_time")).filter(
+    pl.col("dep_time").is_in([517, 1530, 2400])
+).unique().sort("dep_time")
+```
+
+`flights` already carries R4DS's `hour` and `minute` columns, which equal
+`sched_dep_time // 100` and `% 100`. To build real datetimes, see
+[Dates, Times & Durations](datetime.qmd#sec-dt-build).
+
+**Round departure times to 15 minutes**, to the nearest and down:
+
+```{python}
+def minutes_to_hhmm(minutes: pl.Expr) -> pl.Expr:
+    return minutes // 60 * 100 + minutes % 60
+
+sched_min = hhmm_to_minutes("sched_dep_time")
+nearest_15 = ((sched_min / 15).round() * 15).cast(pl.Int64) % 1440
+floor_15 = sched_min // 15 * 15
+
+flights_df.select(
+    "sched_dep_time",
+    nearest_15=minutes_to_hhmm(nearest_15),
+    floor_15=minutes_to_hhmm(floor_15),
+).filter(pl.col("sched_dep_time").is_in([1307, 1308, 2359])).unique().sort("sched_dep_time")
+```
+
+23:59 rounds to midnight, `0`; without `% 1440` it would be `2400`. On a
+`Datetime`, `dt.round("15m")` and `dt.truncate("15m")` do this directly
+([Rounding](datetime.qmd#sec-dt-rounding)).
+
+**Share of flights delayed more than 15 minutes, by scheduled hour:**
+
+```{python}
+late = pl.col("dep_delay") > 15
+flights_df.group_by(hour=pl.col("sched_dep_time") // 100).agg(
+    n=pl.len(),
+    n_late=late.sum(),
+    prop_late=late.mean().round(3),
+).filter(pl.col("hour") > 1).sort("prop_late", descending=True).head(3)
+```
+
+`prop_late` is not `n_late / n`: `mean()` skips the cancelled flights (null
+`dep_delay`), while `n` counts them.
+
+**Names from a lookup table** (≈ `left_join(airlines)`). `replace_strict()`
+takes the old and new values as two Series, and raises if a code is missing
+from the lookup, which makes it a completeness check too:
+
+```{python}
+airlines_df = datasets.airlines()
+flights_df.group_by("carrier").len().with_columns(
+    name=pl.col("carrier").replace_strict(airlines_df["carrier"], airlines_df["name"])
+).sort("len", descending=True).head(3)
+```
+
+## See also {#sec-num-see-also}
+
+- Cheatsheet:
+  [Create & Modify Columns](../overview/polars-cheatsheet.qmd#sec-cs-mutate)
+  (conditionals and recoding) ·
+  [Factors & Binning](../overview/polars-cheatsheet.qmd#sec-cs-factors)
+- Related: [Missing Values](missing.qmd#sec-na-propagation) (Kleene logic,
+  null conditions in `when`) ·
+  [Data Model](../core/data-model.qmd#sec-dm-integers) (integer widths,
+  overflow, `Decimal`) ·
+  [Expressions & Contexts](../core/expressions.qmd#sec-expr-literals) (when a
+  string is a column) ·
+  [Window Functions](../transform/window.qmd#sec-win-rank) (ranks) ·
+  [Categorical & Enum](categorical.qmd)
+- Python API:
+  [`Expr.round`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.round.html) ·
+  [`Expr.replace_strict`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.replace_strict.html) ·
+  [`Expr.bin_intervals`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.bin_intervals.html)
+- R4DS 2e: [Logical vectors](https://r4ds.hadley.nz/logicals.html) ·
+  [Numbers](https://r4ds.hadley.nz/numbers.html)

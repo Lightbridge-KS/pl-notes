@@ -12,8 +12,8 @@ the book until it is listed there.
 
 - Targets Polars 2.x. Render one chapter with `uv run quarto render <file>`, the
   book with `uv run quarto render`.
-- Parts are folders: `core/`, `transform/`, `types/`, `scale/` (later `program/`,
-  `ecosystem/`, `qa/`). A stub has a `🚧 Stub` callout listing its planned
+- Parts are folders: `core/`, `transform/`, `types/`, `scale/`, `program/`
+  (later `ecosystem/`, `qa/`). A stub has a `🚧 Stub` callout listing its planned
   scope; replace the callout when writing the chapter.
 - Anatomy: **In tidyverse** (R code in ```` ```r ````, shown, never run) →
   **Mental model** (ASCII diagram) → **Mechanics** (runnable Polars, small to

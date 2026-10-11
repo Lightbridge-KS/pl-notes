@@ -1,0 +1,672 @@
+---
+title: "Nested Data"
+subtitle: "≈ purrr list-columns · tidyr rectangling · jsonlite"
+jupyter: python3
+---
+
+A tibble cell can hold anything: a vector, a model, another tibble. A Polars
+cell holds one value of the column's dtype, and three dtypes nest: **List**
+(variable length), **Array** (fixed width) and **Struct** (named fields), plus
+**Map** for keys that are data. Each has a namespace (`list.*`, `arr.*`,
+`struct.*`, `map.*`) that works inside the cells without leaving Rust, which
+is the job purrr's `map_*()` family does for list-columns. This chapter covers
+the dtypes, their namespaces, JSON in and out, and rectangling nested JSON into
+a tidy frame. The `explode()` / `unnest()` basics are in
+[Reshaping](../transform/reshape.qmd#sec-rs-nested); the everyday purrr
+translations are in the cheatsheet's
+[List Columns & Structs](../overview/polars-cheatsheet.qmd#sec-cs-nested).
+
+## In tidyverse {#sec-nest-tidyverse}
+
+```r
+library(tidyverse)
+
+masses <- penguins |> summarise(mass = list(body_mass_g), .by = species)
+masses |> mutate(
+  n     = map_int(mass, length),                            # or lengths(mass)
+  mean  = map_dbl(mass, \(x) mean(x, na.rm = TRUE)),
+  heavy = map(mass, \(x) keep(x, \(m) !is.na(m) & m > 5000)),
+)
+tibble(now = list(c(12, 9)), prior = list(c(10, 9))) |>
+  mutate(change = map2(now, prior, \(x, y) x - y))
+
+# R4DS "Hierarchical data": rectangle parsed JSON
+reports <- jsonlite::read_json("reports.json")              # nested lists
+tibble(report = reports) |>
+  unnest_wider(report) |>                                   # named list   → columns
+  unnest_longer(series) |>                                  # unnamed list → rows
+  hoist(series, desc = "description")                       # pull one field out
+```
+
+Two differences shape everything below:
+
+1. An R list-column is heterogeneous: `list(1:3, "a", lm_fit)` is fine. A
+   Polars `List` has **one inner dtype** shared by every element of every row.
+2. purrr calls an R function once **per cell**. `list.eval()` runs one
+   expression over **all cells at once**, vectorised.
+
+## Mental model {#sec-nest-model}
+
+```text
+          one cell                     width          inner dtype         R analog
+ List     [12, 9, 15] · [] · null      varies by row  one, for all cells  list-column of vectors
+ Array    [0.9, 0.1, 0.0]              fixed (dtype)  one                 matrix column
+ Struct   {long: 8.2, short: 6.1}      fixed fields   one per field       data-frame column (df$size$long)
+ Map      {"T1": 4.1, "T2": 3.2}       keys vary      key + value         named list
+
+          namespace   → rows                    → columns
+ List     list.*      explode()                 list.to_struct(fields) + unnest()
+ Array    arr.*       explode()                 arr.to_struct() + unnest()
+ Struct   struct.*    —                         unnest()
+ Map      map.*       map.entries() + explode() —
+```
+
+In memory (Arrow layout) a List column is one flat column of all elements
+plus offsets marking where each row's list starts. `list.*` methods work on
+that flat column in bulk; nothing loops over rows in Python. The dtype table is
+in [Data Model](../core/data-model.qmd#sec-dm-dtypes).
+
+## Mechanics {#sec-nest-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import datetime as dt
+import io
+import json
+import tempfile
+from pathlib import Path
+
+import polars as pl
+from pl_notes import datasets
+
+penguins_df = datasets.penguins()
+flights_df = datasets.flights()
+```
+
+### Making nested columns {#sec-nest-sources}
+
+Inside `agg()`, any expression that does not aggregate gives a List
+([Grouping](../transform/group-agg.qmd#sec-grp-list-trap)):
+
+```{python}
+penguins_df.group_by("species", maintain_order=True).agg(
+    islands=pl.col("island").unique().sort(),   # length-changing → List
+    masses=pl.col("body_mass_g"),               # no aggregation  → List
+).with_columns(n_islands=pl.col("islands").list.len(), mass_max=pl.col("masses").list.max())
+```
+
+`pl.concat_list()` / `pl.concat_arr()` pack a row into a List / Array (≈
+`c_across()`), `pl.struct()` into a Struct (≈ `pick()`), and `implode()` packs
+a whole column (or, with `.over()`, a group) into one cell:
+
+```{python}
+penguins_df.head(2).select(
+    as_list=pl.concat_list("bill_length_mm", "bill_depth_mm"),
+    as_array=pl.concat_arr("bill_length_mm", "bill_depth_mm"),
+    as_struct=pl.struct("bill_length_mm", "bill_depth_mm"),
+    all_years=pl.col("year").implode(),
+)
+```
+
+`str.split()` gives `List(String)` ([Reshaping](../transform/reshape.qmd#sec-rs-strings));
+JSON gives any nesting (@sec-nest-json).
+
+### Element access and summaries {#sec-nest-access}
+
+A toy follow-up CT: one longest diameter per target lesion, this exam and the
+prior. `[]` means read, no lesions; `null` means not measured.
+
+```{python}
+lesions_df = pl.DataFrame({
+    "study":    ["CT-1", "CT-2", "CT-3", "CT-4"],
+    "long_mm":  [[12, 9, 15], [7], [], None],
+    "prior_mm": [[10, 9, 20], [5], [], [8]],
+})
+
+lesions_df.select(
+    "study", "long_mm",
+    first=pl.col("long_mm").list.first(),
+    last=pl.col("long_mm").list.get(-1, null_on_oob=True),
+    n=pl.col("long_mm").list.len(),
+    total=pl.col("long_mm").list.sum(),
+    mean=pl.col("long_mm").list.mean(),
+)
+```
+
+- `get()` is 0-based; negative indices count from the end. Out of bounds
+  **raises** unless `null_on_oob=True`; `first()` / `last()` never raise.
+- The empty list gives `len` 0 and `sum` 0, but `null` for `first`, `mean`
+  and `max` (R: `max(integer(0))` is `-Inf` with a warning, `mean()` is
+  `NaN`). A null list gives null everywhere.
+- `list.item()` returns the single element and raises unless the list has
+  exactly one; use it to assert "one match per row".
+
+```{python}
+#| error: true
+lesions_df.select(pl.col("long_mm").list.get(0))   # CT-3 is empty
+```
+
+### `list.eval()` ≈ `map()` {#sec-nest-eval}
+
+Inside `list.eval()`, `pl.element()` (≈ `.x`) is one list seen as a tiny
+column. Anything that works on a column works on it, including expressions
+that need the whole list: ranks, cumulative sums, `when/then`, and division by
+an aggregate.
+
+```{python}
+lesions_df.select(
+    "study",
+    measurable=pl.col("long_mm").list.eval(pl.element() >= 10),   # RECIST: ≥ 10 mm
+    rank=pl.col("long_mm").list.eval(pl.element().rank("dense", descending=True)),
+    share=pl.col("long_mm").list.eval((pl.element() / pl.element().sum()).round(2)),
+    label=pl.col("long_mm").list.eval(
+        pl.when(pl.element() >= 10).then(pl.lit("target")).otherwise(pl.lit("small"))
+    ),
+)
+```
+
+An aggregation inside `eval()` still returns a list (of one). `list.agg()`
+unwraps it: a scalar result becomes a plain column, anything else stays a
+list. As in `group_by().agg()` (@sec-grp-list-trap), the decision is static:
+it depends on the expression, not on the data.
+
+```{python}
+lesions_df.select(
+    "study",
+    eval_sum=pl.col("long_mm").list.eval(pl.element().sum()),
+    agg_sum=pl.col("long_mm").list.agg(pl.element().sum()),
+    agg_n_big=pl.col("long_mm").list.agg((pl.element() >= 10).sum()),
+    agg_big=pl.col("long_mm").list.agg(pl.element().filter(pl.element() >= 10)),
+)
+```
+
+`eval()` sees the list and nothing else; another column is an error:
+
+```{python}
+#| error: true
+lesions_df.select(pl.col("long_mm").list.eval(pl.element() - pl.col("prior_mm")))
+```
+
+### Two lists at once ≈ `map2()` {#sec-nest-map2}
+
+Arithmetic between list columns is element-wise, row by row, so most `map2()`
+calls need no `eval()` at all. Do the arithmetic first, then `eval()` the
+result. A scalar, or a plain column, broadcasts across each row's list.
+
+```{python}
+change = pl.col("long_mm") - pl.col("prior_mm")
+
+lesions_df.select(
+    "study",
+    change_mm=change,
+    change_pct=(change / pl.col("prior_mm") * 100).list.eval(pl.element().round()),
+    grew=change.list.eval(pl.element() > 0),
+    long_cm=pl.col("long_mm") / 10,
+)
+```
+
+The rows must pair up: equal lengths in every row, or `ShapeError`. For a
+two-list function that arithmetic can't express, `explode()` both columns
+together (counts must match, nulls included), compute, and `group_by()` a row
+index back into lists.
+
+```{python}
+#| error: true
+lesions_df.select(pl.col("long_mm").list.head(1) - pl.col("prior_mm"))
+```
+
+### Filter, slice, sort, set operations {#sec-nest-filter}
+
+Tags per study, as a radiologist might key them:
+
+```{python}
+tags_df = pl.DataFrame({
+    "study": ["CT-1", "CT-2", "MR-3"],
+    "tags": [["nodule", "emphysema", "nodule"], ["cyst"], ["infarct", "cyst", "atrophy"]],
+})
+watch = ["nodule", "infarct", "hemorrhage"]
+
+tags_df.select(
+    "study",
+    uniq=pl.col("tags").list.unique(maintain_order=True),
+    n_nodule=pl.col("tags").list.count_matches("nodule"),
+    has_cyst=pl.col("tags").list.contains("cyst"),
+    flagged=pl.col("tags").list.set_intersection(watch),
+    text=pl.col("tags").list.sort().list.join("; "),
+)
+```
+
+| purrr / base R, per cell | Polars `list.*` |
+|---|---|
+| `keep(x, p)` / `discard(x, p)` / `compact(x)` | `filter(p)` / `filter(~p)` / `drop_nulls()` |
+| `x[c(1, 3)]`, `head(x, n)`, `x[-1]`, `rev(x)` | `gather([0, 2])`, `head(n)`, `slice(1)`, `reverse()` |
+| `sum(x == "a")` | `count_matches("a")` |
+| `union()`, `intersect()`, `setdiff()` | `set_union()`, `set_intersection()`, `set_difference()`, `set_symmetric_difference()` |
+
+: Beyond the cheatsheet's `sort` / `unique` / `contains` / `join` {.striped}
+
+The set operations take another list column or a Python list (broadcast to
+every row). `unique()` without `maintain_order=True` does not promise an order.
+
+### Arrays: fixed-width vectors {#sec-nest-array}
+
+An Array's width is part of its dtype, which is what embedding vectors need.
+`arr.dot()` gives a dot product per row; with a Python list it broadcasts as a
+query vector. Cosine similarity of four toy finding embeddings to a query:
+
+```{python}
+emb_df = pl.DataFrame(
+    {"term": ["nodule", "mass", "effusion", "fracture"],
+     "vec": [[0.9, 0.1, 0.0], [0.8, 0.3, 0.1], [0.1, 0.9, 0.2], [0.0, 0.2, 0.95]]},
+    schema={"term": pl.String, "vec": pl.Array(pl.Float64, 3)},
+)
+query = [1.0, 0.0, 0.0]
+
+def l2(col: str) -> pl.Expr:
+    return pl.col(col).arr.dot(pl.col(col)).sqrt()
+
+emb_df.with_columns(cos_sim=(pl.col("vec").arr.dot(query) / l2("vec")).round(3))
+```
+
+- `arr.dot("vec_2")` also takes a second Array column: after a cross join,
+  `pl.col("vec").arr.dot("vec_2") / (l2("vec") * l2("vec_2"))` scores every
+  pair.
+- `arr.*` mirrors most of `list.*` (`sum`, `max`, `get`, `eval`, `agg`, …), and
+  in expressions `+ - * /` work element-wise between arrays or with a scalar.
+- List → Array: `list.to_array(width)` or `cast(pl.Array(inner, width))`; both
+  raise if any row has a different length. Array → List: `arr.to_list()`.
+- `to_numpy()` on an Array column gives a 2-D `float64` matrix; on a List
+  column, a 1-D `object` array of arrays. A 2-D numpy array passed to
+  `pl.Series()` becomes an Array column.
+
+### Structs {#sec-nest-struct}
+
+`pl.struct()` packs columns into one value per row. The `struct` namespace
+reads and edits fields without unpacking:
+
+```{python}
+bill_df = penguins_df.head(3).select(
+    "species", bill=pl.struct(length="bill_length_mm", depth="bill_depth_mm")
+)
+
+bill_df.with_columns(
+    pl.col("bill").struct.with_fields(ratio=(pl.field("length") / pl.field("depth")).round(2)),
+    length=pl.col("bill").struct.field("length"),      # also pl.col("bill").struct["length"]
+)
+```
+
+| tidyverse | Polars `struct.*` |
+|---|---|
+| `df$bill$length` | `field("length")`; `field("a", "b")`, `field("*")` or `field("^l.*$")` for several |
+| `unnest_wider(bill)` inside a pipeline | `pl.col("bill").struct.unnest()` (expression) |
+| `rename()` on the inner columns | `rename_fields(["L", "D"])` (all names, in order) |
+| `mutate()` on the inner columns | `with_fields(...)`, with `pl.field("name")` for siblings |
+| `select()` on the inner columns | `eval(...)` keeps only what you list; `drop(["depth"])` |
+| `jsonlite::toJSON()` per row | `json_encode()` → String |
+
+: Inside a struct {.striped}
+
+Inside `with_fields()` and `eval()`, `pl.field()` names a sibling field and
+`pl.col()` still names a frame column.
+
+A struct is also the way to treat several columns as one value. It compares
+field by field, so it works as a key in `sort()`, `unique()`, `n_unique()`
+([Selectors](../core/selectors.qmd#sec-sel-rowwise)) and `group_by()`. A
+grouped struct key keeps the first field's name:
+
+```{python}
+penguins_df.group_by(pl.struct("species", "island")).len().sort("species").head(3)
+```
+
+`.unnest("species")` splits it back into two columns. `max()` and `min()` are
+not defined for structs.
+
+### JSON {#sec-nest-json}
+
+#### JSON strings in a column {#sec-nest-json-decode}
+
+`str.json_decode()` needs the target dtype: in 2.0 there is no inference and
+no `infer_schema_length`. Missing keys become null; keys absent from the
+dtype are dropped.
+
+```{python}
+raw_df = pl.DataFrame({"payload": [
+    '{"acc": "A1", "modality": "CT", "dose": 12.5, "tags": ["chest", "contrast"]}',
+    '{"acc": "A2", "modality": "MR", "tags": []}',
+    '{"acc": "A3", "modality": "CT", "dose": 3, "tags": null, "extra": "x"}',
+]})
+payload_dtype = pl.Struct(
+    {"acc": pl.String, "modality": pl.String, "dose": pl.Float64, "tags": pl.List(pl.String)}
+)
+
+raw_df.select(pl.col("payload").str.json_decode(payload_dtype)).unnest("payload")
+```
+
+`"extra"` is gone without a word, and `"tags": null` vs `"tags": []` survives
+as null vs empty. Don't know the dtype? Let `read_ndjson()` infer it from the
+strings (from the first 100 unless `infer_schema_length=None`), then decode
+with what it found:
+
+```{python}
+sample = "\n".join(raw_df["payload"].drop_nulls())
+inferred_dtype = pl.Struct(pl.read_ndjson(io.StringIO(sample)).schema)
+inferred_dtype
+```
+
+`str.json_path_match()` pulls one value by JSONPath without decoding the rest,
+always as String (≈ `hoist()` then `as.character()`):
+
+```{python}
+raw_df.select(
+    modality=pl.col("payload").str.json_path_match("$.modality"),
+    dose=pl.col("payload").str.json_path_match("$.dose"),
+    tag1=pl.col("payload").str.json_path_match("$.tags[0]"),
+)
+```
+
+**Keys that are data.** When the keys vary by row (sequence names, lab
+codes), a Struct would need every possible key as a field. Decode into a
+`Map` instead; `map.entries()` + `explode()` + `unnest()` gives one row per
+key (≈ `unnest_longer()` on a named list, or `enframe()`):
+
+```{python}
+adc_df = pl.DataFrame({
+    "acc": ["MR-1", "MR-2"],
+    "adc": ['{"lesion_a": 0.62, "lesion_b": 1.10}', '{"lesion_a": 0.85}'],
+}).with_columns(pl.col("adc").str.json_decode(pl.Map(pl.String, pl.Float64)))
+
+adc_df.with_columns(pl.col("adc").map.entries()).explode("adc").unnest("adc")
+```
+
+`map.get("lesion_a")`, `map.keys()`, `map.values()` and `map.len()` work
+without exploding.
+
+#### JSON files {#sec-nest-json-files}
+
+| R | Polars | Input |
+|---|---|---|
+| `jsonlite::fromJSON()` | `pl.read_json()` | one JSON array of objects (or one object → one row) |
+| `jsonlite::stream_in()` | `pl.read_ndjson()` / `pl.scan_ndjson()` | one object per line; scan is lazy |
+| `jsonlite::flatten()` | `pl.json_normalize(records)` | parsed Python dicts; nested objects → `a.b` columns |
+| `jsonlite::write_json()` | `df.write_json()` / `df.write_ndjson()` | array of row objects / one object per line |
+
+: Readers and writers {.striped}
+
+Each reader rejects the other's format. Both infer the schema from the first
+`infer_schema_length=100` rows, and they disagree about what comes later:
+
+```{python}
+late_key = [{"acc": f"A{i}", "dose": 1} for i in range(3)] + [{"acc": "A9", "dose": 2, "note": "late"}]
+ndjson_text = "\n".join(json.dumps(r) for r in late_key)
+
+pl.read_ndjson(io.StringIO(ndjson_text), infer_schema_length=2).tail(1)   # "note" silently dropped
+```
+
+```{python}
+#| error: true
+pl.read_json(io.StringIO(json.dumps(late_key)), infer_schema_length=2)
+```
+
+Within the inference window, `read_json()` resolves conflicting types to
+String (`1`, `"x"`, `2.5` all become text). JSON has no date type, so a round
+trip loses dtypes; pass the schema back in:
+
+```{python}
+src_df = pl.DataFrame({
+    "acc": ["A1"], "scanned": [dt.datetime(2026, 3, 2, 9, 30)],
+    "tags": [["chest"]], "size_mm": [{"long": 8.2, "short": 6.1}],
+})
+
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "reports.ndjson"
+    src_df.write_ndjson(path)
+    print(path.read_text())
+    back_schema = pl.read_ndjson(path).schema
+    back_equal = pl.read_ndjson(path, schema=src_df.schema).equals(src_df)
+
+back_schema["scanned"], back_equal
+```
+
+Arrays come back as Lists for the same reason.
+
+### Rectangling: tidyr verbs → Polars {#sec-nest-rectangling}
+
+| tidyr | Polars | Note |
+|---|---|---|
+| `unnest_wider(s)` | `df.unnest("s")` | struct → columns |
+| `unnest_wider(s, names_sep = "_")` | `df.unnest("s", separator="_")` | avoids name clashes |
+| `unnest_wider(l, names_sep = "_")`, unnamed list | `l.list.to_struct(fields=[...])` + `unnest()` | `fields` is required |
+| `unnest_longer(l)` | `df.explode("l", keep_nulls=False)` | plain `explode()` keeps null rows |
+| `unnest_longer(l, keep_empty = TRUE)` | `df.explode("l", empty_as_null=True)` | |
+| `unnest_longer(l, indices_to = "i")` | `with_columns(i=pl.int_ranges(pl.col("l").list.len())).explode("l", "i")` | 0-based |
+| `unnest_longer()` on a named list | Map: `map.entries()` + `explode()` + `unnest()` | @sec-nest-json-decode |
+| `hoist(s, x = c("a", "b"))` | `pl.col("s").struct.field("a").struct.field("b")` | source field stays |
+| `hoist(s, x = list("l", 1))` | `pl.col("s").struct.field("l").list.get(0, null_on_oob=True)` | 0-based |
+| a field of every struct in a list | `pl.col("l").list.eval(pl.element().struct.field("a"))` | `struct.field()` on a list fails |
+
+: Rectangling {.striped}
+
+The full study → series → findings walk is the first recipe (@sec-nest-recipes).
+
+### purrr → Polars {#sec-nest-purrr}
+
+| purrr | Polars | Note |
+|---|---|---|
+| `map_dbl(x, f)`, any aggregating `f` | `x.list.agg(f(pl.element()))` | scalar out; `mean`, `max`, `median`, `std`, … have shortcuts |
+| `some(x, p)` / `every(x, p)` | `x.list.eval(p).list.any()` / `.list.all()` | `all([])` is true |
+| `imap(x, \(v, i) ...)` | `pl.int_range(pl.len())` inside `eval()` | 0-based index |
+| `map2(x, y, \(a, b) a - b)` | `x - y` | equal lengths per row |
+| ``reduce(x, `+`)`` / ``accumulate(x, `+`)`` | `x.list.sum()` / `x.list.eval(pl.element().cum_sum())` | `pl.fold()` folds across *columns* |
+| `list_flatten(x)` | `x.list.eval(pl.element().explode())` | one level |
+| `list_rbind()` of a list of frames | `pl.concat(frames)` | a list-of-struct column: `explode()` + `unnest()` |
+| `pluck(x, "a", 1)` | `struct.field("a").list.get(0)` | |
+| `nest(.by = g)` | `group_by("g").agg(data=pl.struct(pl.exclude("g")))` | List(Struct) ≈ a list of tibbles |
+| `map(x, any_r_function)` | `x.map_elements(f, return_dtype=...)` | one Python call per row |
+
+: Here `x` means a List expression such as `pl.col("x")` {.striped}
+
+## Where it bites {#sec-nest-gotchas}
+
+| tidyverse | Polars |
+|---|---|
+| a list-column holds anything | one inner dtype; hand-built lists coerce silently |
+| `NULL` and `integer(0)` both have length 0 | null list (`len` null) ≠ empty list (`len` 0) |
+| `x[[5]]` on a short vector errors; `x[5]` gives `NA` | `get(i)` raises; `null_on_oob=True` gives null |
+| `jsonlite` keeps every key | `json_decode` drops unlisted keys and truncates floats into integer fields |
+| `fromJSON()` reads all rows | `read_ndjson` drops keys first seen after row 100 |
+| `unnest_wider(names_sep = "_")` widens to the longest list | `to_struct(fields)` keeps only as many as you name |
+| `map()` runs R per cell | `map_elements()` runs Python per row |
+
+: The differences at a glance {.striped}
+
+### Hand-built lists coerce silently {#sec-nest-construction}
+
+A flat column with mixed `int` and `float` raises
+([Data Model](../core/data-model.qmd#sec-dm-construction)). A list column
+takes its inner dtype from the first list and truncates later floats to fit:
+
+```{python}
+pl.Series([[1, 2], [3.7], [True]]).to_list()
+```
+
+Strings still raise. Give the dtype (`dtype=pl.List(pl.Float64)`) or write
+`1.0` first.
+
+### `json_decode` truncates into integer fields {#sec-nest-json-trap}
+
+```{python}
+pl.DataFrame({"j": ['{"dose": 12.9}', '{"dose": -1.9}']}).select(
+    as_int=pl.col("j").str.json_decode(pl.Struct({"dose": pl.Int64})).struct.field("dose"),
+    as_u8=pl.col("j").str.json_decode(pl.Struct({"dose": pl.UInt8})).struct.field("dose"),
+)
+```
+
+12.9 becomes 12, and −1.9 becomes −1, or null in an unsigned field.
+`read_ndjson()` with the same `Int64` schema raises instead. A JSON string
+(`"7"`) in a numeric field raises in both. Decode numbers as `Float64` and
+convert deliberately: `cast(pl.Int64, strict=True)` truncates 12.9 to 12 as
+well, so test `x == x.round()` first.
+
+### Null is not empty {#sec-nest-null-empty}
+
+`[]` and null are different values (@sec-nest-access), and they part ways at
+`explode()` ([Reshaping](../transform/reshape.qmd#sec-rs-nested)): the empty
+row vanishes, the null row stays. `"".str.split(",")` is `[""]`, a list with
+one empty string, not `[]`. Count "no tags" with
+`pl.col("tags").list.len() == 0`, which is null for a null list; add
+`| pl.col("tags").is_null()` if both mean "none".
+
+### Comparing lists {#sec-nest-compare}
+
+Arithmetic broadcasts into lists, comparisons do not:
+`pl.col("long_mm") > 10` raises a `SchemaError`
+([Grouping](../transform/group-agg.qmd#sec-grp-list-trap)). Use
+`list.eval(pl.element() > 10)`. `==` between two list columns compares whole
+lists (one Boolean per row), and lists are ordered: `[1, 2]` and `[2, 1]` are
+different keys in `group_by()` and `unique()`. Sort the lists first for set
+semantics.
+
+### `map_elements()` on lists {#sec-nest-map-elements}
+
+It hands each row's list to Python as a `pl.Series`, one call per row:
+
+```{python}
+calls = 0
+
+def py_max(s: pl.Series) -> int | None:
+    global calls
+    calls += 1
+    return s.max()
+
+pairs_df = flights_df.select(delays=pl.concat_list("dep_delay", "arr_delay"))
+via_python = pairs_df.select(pl.col("delays").map_elements(py_max, return_dtype=pl.Int64))
+calls, via_python.equals(pairs_df.select(pl.col("delays").list.max()))
+```
+
+336,776 Python calls for an answer `list.max()` computes in one pass; on the
+machine that wrote this chapter the native version was about 10× faster. Reach
+for `map_elements()` only when no `list.*` / `eval()` expression exists. See
+[Performance](../scale/performance.qmd).
+
+## Recipes {#sec-nest-recipes}
+
+**A radiology report JSON → one row per finding** (R4DS rectangling). Study →
+series → findings, with sizes that have different keys per finding:
+
+```{python}
+reports_json = """[
+ {"accession": "CT-1001", "study": {"date": "2026-03-02", "body_part": "CHEST"},
+  "series": [
+   {"number": 2, "description": "Axial 1 mm", "findings": [
+     {"label": "nodule", "site": "RUL", "size_mm": {"long": 8.2, "short": 6.1}},
+     {"label": "nodule", "site": "LLL", "size_mm": {"long": 4.0}}]},
+   {"number": 5, "description": "Coronal MIP", "findings": []}]},
+ {"accession": "CT-1002", "study": {"date": "2026-03-02", "body_part": "ABDOMEN"},
+  "series": [{"number": 3, "description": "Portal venous",
+              "findings": [{"label": "cyst", "site": "liver S7", "size_mm": {"long": 12}}]}]},
+ {"accession": "MR-2001", "study": {"date": "2026-03-03", "body_part": "BRAIN"}, "series": []}
+]"""
+
+reports_df_raw = pl.read_json(io.StringIO(reports_json))
+reports_df_raw.schema
+```
+
+`read_json()` unified the `size_mm` keys across findings (`short` is null where
+absent) and the `12` with `8.2` as `Float64`. Then one verb per level:
+
+```{python}
+findings_df = (
+    reports_df_raw
+    .unnest("study")                                      # unnest_wider(study)
+    .explode("series", empty_as_null=True)                # unnest_longer(series, keep_empty = TRUE)
+    .unnest("series", separator="_")                      # unnest_wider(series, names_sep = "_")
+    .explode("series_findings", empty_as_null=True)
+    .unnest("series_findings")
+    .unnest("size_mm", separator="_")
+    .with_columns(pl.col("date").str.to_date())
+)
+findings_df.select("accession", "series_number", "label", "site", "size_mm_long", "size_mm_short")
+```
+
+`empty_as_null=True` keeps the MR with no series and the MIP series with no
+findings as all-null rows; drop it for "findings only". Per-study summaries
+need no rectangling at all:
+
+```{python}
+reports_df_raw.select(
+    "accession",
+    n_series=pl.col("series").list.len(),
+    labels=pl.col("series").list.eval(
+        pl.element().struct.field("findings").explode().struct.field("label")
+    ),
+)
+```
+
+**Top-3 arrival delays per carrier, kept as a list, then summarised.**
+`top_k()` returns its values in no particular order, so sort inside `agg()`:
+
+```{python}
+flights_df.group_by("carrier").agg(
+    top3=pl.col("arr_delay").top_k(3).sort(descending=True),
+    median=pl.col("arr_delay").median(),
+).with_columns(
+    top3_mean=pl.col("top3").list.mean().round(1),
+    worst_vs_3rd=pl.col("top3").list.first() - pl.col("top3").list.last(),
+).sort("top3_mean", descending=True).head(4)
+```
+
+**Free-text keywords → clean tags → counts and flags.**
+
+```{python}
+keywords_df = pl.DataFrame({
+    "study": ["CT-1", "CT-2", "CT-3", "MR-4", "CR-5"],
+    "keywords": ["Nodule, emphysema", "nodule,nodule, Effusion", "", None, "fracture "],
+})
+
+tags_df_clean = keywords_df.with_columns(
+    tags=pl.col("keywords")
+    .str.split(",")
+    .list.eval(pl.element().str.strip_chars().str.to_lowercase())
+    .list.filter(pl.element() != "")
+    .list.unique(maintain_order=True)
+)
+tags_df_clean.with_columns(
+    n_tags=pl.col("tags").list.len(),
+    chest=pl.col("tags").list.set_intersection(["nodule", "emphysema", "effusion"]),
+).drop("keywords")
+```
+
+Tag frequency is `explode("tags")` + `group_by("tags").len()`. A one-hot
+matrix (in R, `unnest_longer()` + `pivot_wider()`) needs no reshaping: one
+`list.contains()` per tag.
+
+```{python}
+vocab = tags_df_clean["tags"].explode().drop_nulls().unique().sort().to_list()
+
+tags_df_clean.select("study", *[pl.col("tags").list.contains(t).alias(t) for t in vocab])
+```
+
+The null row (MR-4) stays null across the board; CT-3's empty string became
+`[]` and reads `false`.
+
+## See also {#sec-nest-see-also}
+
+- Cheatsheet: [List Columns & Structs](../overview/polars-cheatsheet.qmd#sec-cs-nested) ·
+  [Reshape](../overview/polars-cheatsheet.qmd#sec-cs-reshape)
+- Related: [Reshaping](../transform/reshape.qmd#sec-rs-nested) (`explode()`,
+  `unnest()`, splitting strings) ·
+  [Grouping & Aggregation](../transform/group-agg.qmd#sec-grp-reframe) (lists from
+  `agg()`) · [Selectors](../core/selectors.qmd#sec-sel-rowwise) (`concat_list`,
+  `pl.struct` across columns) · [Data Model](../core/data-model.qmd#sec-dm-dtypes) ·
+  [Lazy API](../scale/lazy.qmd) (`scan_ndjson`)
+- Polars user guide: [Lists and arrays](https://docs.pola.rs/user-guide/expressions/lists-and-arrays/) ·
+  [Structs](https://docs.pola.rs/user-guide/expressions/structs/) ·
+  [JSON files](https://docs.pola.rs/user-guide/io/json/)
+- Python API: [List namespace](https://docs.pola.rs/api/python/stable/reference/expressions/list.html) ·
+  [Struct namespace](https://docs.pola.rs/api/python/stable/reference/expressions/struct.html)
+- R4DS 2e: [Hierarchical data](https://r4ds.hadley.nz/rectangling.html) · tidyr:
+  `vignette("rectangle")`

@@ -1,0 +1,601 @@
+---
+title: "Time-Series Operations"
+subtitle: "≈ slider · tsibble · `floor_date()` + `summarise()`"
+jupyter: python3
+---
+
+A time series needs three operations beyond plain grouping: **bucket** rows
+into periods (downsample), **slide** a window along time, and **resample**
+onto a regular grid (upsample). A fourth, aligning two series by nearest time,
+is a join. R spreads these over lubridate, tsibble, slider and dplyr's
+`closest()`. Polars has three frame methods and `join_asof()`, and all four
+need a sorted time index. Dtypes, `truncate()` and DST are in
+[Dates & Times](datetime.qmd); expression-level `rolling_*_by()` is in
+[Window Functions](../transform/window.qmd#sec-win-rolling-time).
+
+## In tidyverse {#sec-ts-tidyverse}
+
+```r
+library(tidyverse)
+library(nycflights13)
+library(tsibble)
+library(slider)
+
+# fixed buckets: floor_date() + summarise()
+weather |>
+  group_by(origin, day = floor_date(time_hour, "day")) |>
+  summarise(temp = mean(temp, na.rm = TRUE), .groups = "drop")
+
+# tsibble: the index and the series key belong to the object
+weather_ts <- as_tsibble(weather, key = origin, index = time_hour)
+weather_ts |> group_by_key() |> index_by(day = as_date(time_hour)) |>
+  summarise(temp = mean(temp, na.rm = TRUE))
+weather_ts |> fill_gaps() |> group_by_key() |> fill(temp, .direction = "down")
+
+# slider: windows that slide
+jfk <- filter(weather, origin == "JFK")
+slide_index_dbl(jfk$temp, jfk$time_hour, \(x) mean(x, na.rm = TRUE), .before = hours(2))
+slide_period_dbl(jfk$temp, jfk$time_hour, "month", \(x) mean(x, na.rm = TRUE), .before = 2)
+
+# the latest observation at or before each departure
+flights |>
+  mutate(dep_at = time_hour + minutes(minute + dep_delay)) |>
+  left_join(weather, join_by(origin, closest(dep_at >= time_hour)))
+```
+
+tsibble checks the index and key for you and arranges the rows; slider wants
+an ascending index; `floor_date()` + `summarise()` works in any row order.
+Polars asks you to sort, then checks (@sec-ts-sorted).
+
+## Mental model {#sec-ts-model}
+
+Three ways to put six readings into windows:
+
+```text
+ hour     0   1   2   3   4   5   6   7   8   9   10  11  12
+ x        1   2   3       4   5               6
+
+ ① group_by(pl.col("t").dt.truncate("3h"))    fixed buckets: each row in exactly one
+          [──────────)[──────────)            [──────────)                  3 rows
+           {1 2 3}     {4 5}       6–9: none   {6}
+
+ ② group_by_dynamic("t", every="3h", period="6h")    a grid of windows that overlap
+          [──────────────────────) {1 2 3 4 5}
+                      [──────────────────────) {4 5}
+                                  [──────────────────────) {6}
+                                              [─────────────── …) {6}       4 rows
+
+ ③ rolling("t", period="3h")    one window per row, looking back: (t − 3h, t]
+      (───────────] at 2 → {1 2 3}
+              (───────────] at 4 → {3 4}
+                                  (───────────] at 9 → {6}                  6 rows
+```
+
+| | Windows come from | A row belongs to | Rows out | Labelled by | ≈ R |
+|---|---|---|---|---|---|
+| `group_by(dt.truncate())` | the clock | exactly one | one per non-empty bucket | bucket start | `floor_date()` + `summarise()`; tsibble `index_by()` |
+| `group_by_dynamic()` | a grid: `every`, `period`, `offset` | none, one or several | one per non-empty window | window start (`label=`) | `slider::slide_period()` |
+| `rolling()` | each row, looking back | several | one per input row | the row's time | `slider::slide_index()` |
+
+: Three ways to bucket time {.striped}
+
+① is a plain `group_by()` on a computed key, covered in
+[Dates & Times](datetime.qmd#sec-dt-ranges). Up- and down-sampling are not
+new verbs: downsampling is ① or ②, upsampling is `upsample()` plus a fill.
+
+## Mechanics {#sec-ts-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import datetime as dt
+
+import polars as pl
+from pl_notes import datasets
+
+weather_df = datasets.weather()            # stored sorted by origin, then time_hour
+flights_df_raw = datasets.flights()        # months stored as 1, 10, 11, 12, 2, …
+flights_df = flights_df_raw.sort("time_hour")
+
+toy_df = pl.DataFrame({
+    "t": [dt.datetime(2013, 1, 1, h) for h in [0, 1, 2, 4, 5, 9]],
+    "x": [1, 2, 3, 4, 5, 6],
+})
+
+
+def windows(grouped) -> list[tuple[str, list[int]]]:
+    """Compact view of a grouping of toy_df: (label hour, x values) per window."""
+    return grouped.agg(pl.col("x")).select(pl.col("t").dt.strftime("%H"), "x").rows()
+```
+
+### `group_by_dynamic()`: windows on a grid {#sec-ts-dynamic}
+
+Three parameters place the windows. For every integer *k*, window *k* is
+`[start + k·every, start + k·every + period)`, where
+`start = truncate(first t, every) + offset`; a window is emitted only if it
+holds at least one row:
+
+```{python}
+{
+    "every=3h": windows(toy_df.group_by_dynamic("t", every="3h")),
+    "every=3h, period=6h": windows(toy_df.group_by_dynamic("t", every="3h", period="6h")),
+    "every=3h, offset=1h": windows(toy_df.group_by_dynamic("t", every="3h", offset="1h")),
+}
+```
+
+- **`every`** is the step between window starts. With `period` left at
+  `None` it is also the length: tumbling windows, the same buckets as
+  `truncate("3h")`. The empty 06:00 window has no row (@sec-ts-empty).
+- **`period`** longer than `every` makes windows overlap, so the 04:00 and
+  05:00 readings are counted twice. Shorter leaves gaps: `every="1d",
+  period="12h", offset="6h"` keeps 06:00–18:00 of each day, and rows outside
+  every window are dropped.
+- **`offset`** shifts the grid to 01:00, 04:00, …; *k* = −1, starting at
+  22:00 the day before, is the window that holds the 00:00 row.
+- Interval strings are those of `offset_by()`; combined units such as
+  `"1h30m"` also work in `every`. `include_boundaries=True` adds
+  `_lower_boundary` and `_upper_boundary` columns.
+
+### `closed` and `label` {#sec-ts-closed-label}
+
+`closed=` picks the inclusive edges (default `"left"`: `[start, end)`), and
+`label=` the timestamp that names each window (default `"left"`: the start):
+
+```{python}
+{
+    **{f"closed={c}": windows(toy_df.group_by_dynamic("t", every="3h", closed=c))
+       for c in ["right", "both", "none"]},
+    **{f"label={lab}": windows(toy_df.group_by_dynamic("t", every="3h", label=lab))
+       for lab in ["right", "datapoint"]},
+}
+```
+
+Against the defaults in the first output above: `"right"` moves each boundary
+row into the earlier window, and a new window `(21:00, 00:00]` appears for
+the 00:00 row. `"both"` counts boundary rows twice. `"none"` loses them: the
+00:00 and 09:00 rows sit on boundaries, so `x = 1` and `x = 6` are in no
+window at all. `label="right"` is the upper boundary, `"datapoint"` the first
+timestamp inside the window. The defaults are `floor_date()`'s convention,
+and tsibble's.
+
+### `start_by`: where the grid begins {#sec-ts-start-by}
+
+`every="1w"` starts weeks on Monday, like `truncate("1w")`. 2013 began on a
+Tuesday:
+
+```{python}
+{
+    start_by: flights_df.group_by_dynamic(
+        "time_hour", every="1w", start_by=start_by, include_boundaries=True
+    )
+    .agg(n=pl.len())
+    .select(pl.col("_lower_boundary").dt.strftime("%a %d %b %H:%M"), "n")
+    .row(0)
+    for start_by in ["window", "datapoint", "monday", "sunday"]
+}
+```
+
+- `"window"` (default): truncate the first timestamp by `every`, add `offset`.
+- `"datapoint"`: start at the first timestamp itself; `offset` is ignored.
+- `"monday"` … `"sunday"`: the weekday before the first row, only when
+  `every` contains `"w"` (ignored for `"1d"`). `floor_date(x, "week")` weeks
+  start on Sunday: `start_by="sunday"`, or `offset="-1d"`.
+
+### Per-series windows: `group_by=` {#sec-ts-group-by}
+
+`group_by=` runs the windows separately per key, like tsibble's
+`group_by_key()`:
+
+```{python}
+weather_df.group_by_dynamic("time_hour", every="1d", group_by="origin").agg(
+    temp=pl.col("temp").mean().round(1),
+    n=pl.len(),
+).sort("origin", "time_hour").head(3)
+```
+
+The index must be sorted **within each group**. `weather` is stored by origin
+then time, and a frame sorted by time alone also qualifies. Unlike
+`join_asof(by=)` ([Joins](../transform/joins.qmd#sec-join-asof)), Polars
+checks this, so a shuffled frame raises instead of returning wrong windows:
+
+```{python}
+#| error: true
+weather_df.sample(fraction=1, shuffle=True, seed=1).group_by_dynamic(
+    "time_hour", every="1d", group_by="origin"
+).agg(n=pl.len())
+```
+
+The result is sorted by time within each group only; sort it before showing
+or comparing. With the defaults (`period = every`, `offset = 0`), a calendar
+`every` gives exactly the buckets of `group_by(dt.truncate(every))`. On a
+time-zoned column, a sub-day `every` does not:
+
+```{python}
+{
+    every: weather_df.group_by_dynamic("time_hour", every=every, group_by="origin")
+    .agg(n=pl.len()).sort("origin", "time_hour")
+    .equals(
+        weather_df.group_by("origin", time_hour=pl.col("time_hour").dt.truncate(every))
+        .agg(n=pl.len()).sort("origin", "time_hour")
+    )
+    for every in ["1h", "3h", "1d", "1w", "1mo"]
+}
+```
+
+`"3h"` is the DST trap in @sec-ts-dst.
+
+### Frame-level `rolling()` {#sec-ts-rolling}
+
+`df.rolling(index, period=)` gives every row its own window, by default
+`(t − period, t]`. `offset` moves the window's start relative to `t` (default
+`-period`), and `closed` defaults to `"right"`:
+
+```{python}
+{
+    "default (t−3h, t]": windows(toy_df.rolling("t", period="3h")),
+    "closed=both [t−3h, t]": windows(toy_df.rolling("t", period="3h", closed="both")),
+    "closed=left [t−3h, t)": windows(toy_df.rolling("t", period="3h", closed="left")),
+    "offset=0h (t, t+3h]": windows(toy_df.rolling("t", period="3h", offset="0h")),
+    "offset=-1h (t−1h, t+2h]": windows(toy_df.rolling("t", period="3h", offset="-1h")),
+}
+```
+
+`closed="left"` excludes the current row: "the three hours before now", a
+feature that can't leak the value it predicts. `offset="0h"` looks ahead, and
+an offset between `-period` and 0 straddles *t*. An empty window gives null
+for `mean()` and `max()`, but 0 for `sum()` and `pl.len()`.
+
+The expression-level `pl.col("temp").rolling_mean_by("time_hour", "3h")` is
+the same window for one built-in statistic. `rolling()` is for several
+aggregations over one window, or any expression:
+
+```{python}
+weather_df_roll = weather_df.rolling("time_hour", period="3h", group_by="origin").agg(
+    temp_3h=pl.col("temp").mean(),
+    gust_3h=pl.col("wind_gust").max(),
+    n_obs=pl.len(),
+)
+weather_df_roll.filter(
+    pl.col("origin") == "EWR",
+    pl.col("time_hour").dt.date() == dt.date(2013, 1, 1),
+    pl.col("time_hour").dt.hour().is_between(11, 14),
+)
+```
+
+EWR has no reading for 12:00, so the 13:00 window holds two rows. The output
+keeps only the keys, the index and the aggregates, and with `group_by=` its
+rows come back grouped rather than in input order. Join it back on the keys;
+`rolling_*_by().over()` keeps row order instead. Both give the same numbers:
+
+```{python}
+temp_3h_by = pl.col("temp").rolling_mean_by("time_hour", "3h").over("origin")
+weather_df_roll.join(
+    weather_df.select("origin", "time_hour", by=temp_3h_by), on=["origin", "time_hour"]
+).select(pl.col("temp_3h").eq_missing(pl.col("by")).all())
+```
+
+On a zoned index, `period="1d"` is a calendar day (23 hours on 2013-03-10) and
+`"24h"` is 24 hours, the same split as `offset_by()`.
+
+### Resampling: up and down {#sec-ts-resample}
+
+Downsampling (hourly → daily) is ① or ② of the mental model. Upsampling is
+`upsample()`: a grid from each group's first to its last timestamp in steps
+of `every`, with the data left-joined onto it. The `group_by=` keys are filled
+in; every other column is null on the new rows. A flag added first tells new
+rows from old nulls, as in [Missing Values](missing.qmd#sec-na-implicit):
+
+```{python}
+weather_df_up = (
+    weather_df.select("origin", "time_hour", "temp")
+    .with_columns(observed=pl.lit(True))
+    .upsample("time_hour", every="1h", group_by="origin", maintain_order=True)
+)
+weather_df_up.group_by("origin").agg(
+    added=pl.col("observed").is_null().sum(),
+    null_temp=pl.col("temp").is_null().sum(),
+).sort("origin")
+```
+
+That is 75 new hours, not the 165 that Missing Values finds against a full
+2013 calendar: `upsample()` never extends past a group's own first and last
+reading, which is tsibble's `fill_gaps()` default. For a shared calendar
+(`fill_gaps(.full = TRUE)`), or on a `LazyFrame`, which has no `upsample()`,
+build the grid with `pl.datetime_range()` and a cross join
+([Reshaping](../transform/reshape.qmd#sec-rs-recipes)). On a zoned column the
+grid steps in real hours: 3 November gets both 01:00 rows, 10 March has no
+02:00.
+
+Then fill. Forward fill is tidyr's `fill(.direction = "down")`; `interpolate()`
+on a regular grid equals `interpolate_by("time_hour")`. Both run per series:
+
+```{python}
+weather_df_up.with_columns(
+    temp_ffill=pl.col("temp").fill_null(strategy="forward").over("origin"),
+    temp_interp=pl.col("temp").interpolate().over("origin"),
+).filter(
+    pl.col("origin") == "EWR",
+    pl.col("time_hour").is_between(
+        pl.datetime(2013, 1, 1, 11, time_zone="America/New_York"),
+        pl.datetime(2013, 1, 1, 13, time_zone="America/New_York"),
+    ),
+)
+```
+
+Both fills also fill nulls that were in the data. To fill only the new rows,
+fill inside `pl.when(pl.col("observed").is_null())`. `df.interpolate()`
+interpolates every numeric column at once (integers become `Float64`) and
+leaves strings null.
+
+### `join_asof()` on time series {#sec-ts-asof}
+
+The basics and the sorting rules are in
+[Joins](../transform/joins.qmd#sec-join-asof). Attach to each departure the
+latest weather reading at its airport:
+
+```{python}
+flights_df_dep = flights_df.filter(pl.col("dep_time").is_not_null()).select(
+    "origin", "carrier", "flight",
+    dep_at=pl.col("time_hour") + pl.duration(minutes=pl.col("minute") + pl.col("dep_delay")),
+).sort("dep_at")
+weather_df_obs = weather_df.select(
+    "origin", "temp", "visib", obs_at="time_hour"
+).sort("obs_at")
+
+flights_df_dep.join_asof(
+    weather_df_obs, left_on="dep_at", right_on="obs_at", by="origin", check_sortedness=False,
+).head(3)
+```
+
+Sorting both frames by time sorts every origin's rows too, so
+`check_sortedness=False` is safe and silences the `by=` warning. The match is
+**backward**: the last reading at or before departure, which is also the
+only one a forecaster had at the time. How far back can it reach?
+
+```{python}
+asof = {"left_on": "dep_at", "right_on": "obs_at", "by": "origin", "check_sortedness": False}
+lag = pl.col("dep_at") - pl.col("obs_at")
+
+pl.concat([
+    flights_df_dep.join_asof(weather_df_obs, **asof, **opts).select(
+        setting=pl.lit(name),
+        unmatched=pl.col("obs_at").null_count(),
+        max_lag=lag.max(),
+        reading_after_dep=(lag < pl.duration()).sum(),
+    )
+    for name, opts in [
+        ("backward", {}),
+        ("backward, tolerance=1h", {"tolerance": "1h"}),
+        ("nearest", {"strategy": "nearest"}),
+    ]
+])
+```
+
+- **No tolerance**: every flight matches, but `weather` stops at 18:00 on
+  30 December, so 31 December's flights get weather up to 30 hours old.
+- **`tolerance="1h"`**: a reading more than an hour old becomes null. 1,554
+  flights fall in a gap or after the data ends; nulls you can see beat stale
+  values you can't.
+- **`strategy="nearest"`** takes whichever reading is closer, which for 53%
+  of the 328,521 departures comes *after* departure. That is fine for describing
+  conditions, but it leaks the future into a model. It still matched
+  31 December to 30 December: `tolerance` is the only distance limit.
+
+## Where it bites {#sec-ts-gotchas}
+
+| R behaviour | Polars behaviour |
+|---|---|
+| `floor_date()` + `summarise()` work in any row order | `group_by_dynamic()`, `rolling()`, `upsample()` raise on an unsorted index (@sec-ts-sorted) |
+| `floor_date(x, "3 hours")` follows the local clock all year | sub-day `every` on a zoned column: fixed steps, one hour off after DST (@sec-ts-dst) |
+| `fill_gaps()` / `complete()` make empty periods explicit | an empty window produces no row (@sec-ts-empty) |
+| `fill_gaps()` and `complete()` only add rows | `upsample()` silently drops rows that are off its grid (@sec-ts-offgrid) |
+| `slide_period(.before = 2)`: one value per period | overlapping windows: partial windows at **both** ends, labelled by their start (@sec-ts-partial) |
+| `slide_index(.before = hours(3))` includes *t* − 3 h | `rolling(period="3h")` excludes it: `(t − 3h, t]`; use `closed="both"` |
+| `floor_date(x, "week")`: Sunday | `every="1w"`: Monday; `start_by="sunday"` |
+| `"1 month"` | `"1mo"`; `"1m"` is a minute ([Dates & Times](datetime.qmd#sec-dt-1m)) |
+
+: The differences at a glance {.striped}
+
+### Unsorted or null index {#sec-ts-sorted}
+
+```{python}
+#| error: true
+flights_df_raw.group_by_dynamic("time_hour", every="1w").agg(n=pl.len())
+```
+
+`rolling()` and `upsample()` raise the same error, with or without
+`group_by=`. A null in the index makes `group_by_dynamic()` and `rolling()`
+raise ("null values … not supported"), but `upsample()` silently drops the
+row. Deal with null timestamps before any of the three.
+
+### Sub-day windows drift after DST {#sec-ts-dst}
+
+Calendar units (`d`, `w`, `mo`, `q`, `y`) step along the local clock.
+Sub-day units are fixed durations, so a `"3h"` grid anchored at 00:00 EST in
+January lands on 01:00, 04:00, … once New York switches to EDT:
+
+```{python}
+jfk_df = weather_df.filter(pl.col("origin") == "JFK")
+def july_hours(df):  # the clock hours at which July's buckets start
+    return df.filter(pl.col("time_hour").dt.month() == 7)["time_hour"].dt.hour().unique().sort().to_list()
+
+{
+    "group_by_dynamic": july_hours(jfk_df.group_by_dynamic("time_hour", every="3h").agg()),
+    "truncate": july_hours(jfk_df.select(pl.col("time_hour").dt.truncate("3h"))),
+}
+```
+
+`truncate()` reads each row's local clock; the window grid does not. For
+clock-aligned sub-day buckets use `group_by(dt.truncate())`, or run
+`group_by_dynamic()` on the wall clock, `dt.replace_time_zone(None)`
+(recipe 2), which puts both 01:00 readings of 3 November in one clock hour.
+
+Calendar days, meanwhile, really are 23 and 25 hours long:
+
+```{python}
+jfk_df.group_by_dynamic("time_hour", every="1d", include_boundaries=True).agg(
+    n=pl.len()
+).filter(
+    pl.col("time_hour").dt.date().is_in([dt.date(2013, 3, 10), dt.date(2013, 11, 3)])
+).select(
+    "time_hour", "n", hours=(pl.col("_upper_boundary") - pl.col("_lower_boundary")).dt.total_hours()
+)
+```
+
+The 25-hour day holds 24 readings because JFK missed 00:00 that day. With
+`every="24h"` the windows would slip to 01:00 after 10 March.
+
+### Empty windows produce no row {#sec-ts-empty}
+
+An hour with no reading gets no row, not a count of 0. Hourly counts on the
+toy frame give 6 rows for the 10 hours from 00:00 to 09:00:
+
+```{python}
+toy_df_hourly = toy_df.group_by_dynamic("t", every="1h").agg(n=pl.len())
+{
+    "rows": toy_df_hourly.height,
+    "after upsample": toy_df_hourly.upsample("t", every="1h")
+    .with_columns(pl.col("n").fill_null(0))["n"].to_list(),
+}
+```
+
+`upsample()` on the result restores the missing labels, which works because
+default labels lie on the grid (not with `label="datapoint"`). It fills only
+between the first and last window; for leading and trailing zeros, join onto
+a `datetime_range()` grid.
+
+### `upsample()` drops off-grid rows {#sec-ts-offgrid}
+
+The grid starts at the first timestamp and steps by `every`; data is
+left-joined onto it. A row between grid points is gone, without a warning:
+
+```{python}
+pl.DataFrame({
+    "t": [dt.datetime(2013, 1, 1, 0, 30), dt.datetime(2013, 1, 1, 2, 0)],
+    "x": [1, 2],
+}).upsample("t", every="1h")
+```
+
+`x = 2` at 02:00 is not on the 00:30 + *k* h grid. Irregular data needs
+aggregating onto the grid first (`group_by_dynamic()` or `truncate()`), then
+`upsample()`.
+
+### Overlapping windows are partial at both ends {#sec-ts-partial}
+
+slider's `slide_period(.before = 2)` gives one value per month: that month and
+the two before it. The Polars windows are `every="1mo", period="3mo",
+offset="-2mo"`, labelled by their *start*, and emitted wherever they hold
+data:
+
+```{python}
+jfk_df.group_by_dynamic(
+    "time_hour", every="1mo", period="3mo", offset="-2mo", include_boundaries=True
+).agg(
+    months=pl.col("time_hour").dt.month().unique().sort(),
+    temp=pl.col("temp").mean().round(1),
+).select(
+    pl.col("_lower_boundary", "_upper_boundary").dt.date(), "months", "temp"
+).pipe(lambda df: pl.concat([df.head(3), df.tail(2)]))
+```
+
+Fourteen windows for twelve months. The two leading partial windows match
+slider's default `.complete = FALSE`; the two trailing ones, starting in
+November and December 2013, have no slider counterpart. Drop them with a
+filter on `_upper_boundary`, and shift the label with `dt.offset_by("2mo")`
+to name each window by its last month, as slider does.
+
+## Recipes {#sec-ts-recipes}
+
+**Weekly flights per origin, weeks starting Monday** (≈ tsibble
+`index_by(week = yearweek(time_hour))`). The first and last weeks are partial:
+
+```{python}
+flights_df.group_by_dynamic("time_hour", every="1w", group_by="origin").agg(
+    n=pl.len()
+).pivot("origin", index="time_hour", values="n", sort_columns=True).sort("time_hour").head(3)
+```
+
+**Maximum wind per origin in 3-hour blocks of local clock time.** Drop the zone
+so the blocks stay on 00:00, 03:00, … all year (@sec-ts-dst). One EWR reading
+of 1,048 mph is an obvious error; turn it into null first:
+
+```{python}
+weather_df.with_columns(
+    clock=pl.col("time_hour").dt.replace_time_zone(None),
+    wind_speed=pl.when(pl.col("wind_speed") < 200).then("wind_speed"),
+).group_by_dynamic("clock", every="3h", group_by="origin").agg(
+    wind_max=pl.col("wind_speed").max(),
+    gust_max=pl.col("wind_gust").max(),
+).sort("wind_max", "origin", "clock", descending=[True, False, False], nulls_last=True).head(3)
+```
+
+**Daily mean temperature from a gap-filled hourly series.** Upsample to make
+missing hours explicit, interpolate per origin, then downsample. A plain
+daily mean weights the hours that happen to exist:
+
+```{python}
+(
+    weather_df_up
+    .with_columns(temp_filled=pl.col("temp").interpolate().over("origin"))
+    .group_by_dynamic("time_hour", every="1d", group_by="origin")
+    .agg(
+        n_obs=pl.col("observed").count(),
+        temp_raw=pl.col("temp").mean(),
+        temp_filled=pl.col("temp_filled").mean(),
+    )
+    .with_columns(diff=(pl.col("temp_filled") - pl.col("temp_raw")).abs())
+    .sort("diff", "origin", "time_hour", descending=[True, False, False])
+    .head(3)
+)
+```
+
+**7-day rolling mean of daily delays.** Summarise to one row per day, then roll
+over dates. The mean of seven daily means gives a day of 291 flights the same
+weight as a day of 900; `rolling()` can carry the sums and weight by flights
+instead:
+
+```{python}
+flights_df_daily = flights_df.group_by(date=pl.col("time_hour").dt.date()).agg(
+    n=pl.col("dep_delay").count(),
+    delay_sum=pl.col("dep_delay").sum(),
+).sort("date")
+
+flights_df_daily.with_columns(delay=pl.col("delay_sum") / pl.col("n")).rolling(
+    "date", period="7d"
+).agg(
+    n=pl.col("n").last(),
+    delay=pl.col("delay").last(),
+    mean_of_days=pl.col("delay").mean(),
+    per_flight=pl.col("delay_sum").sum() / pl.col("n").sum(),
+).filter(pl.col("date").is_between(dt.date(2013, 2, 8), dt.date(2013, 2, 11)))
+```
+
+A blizzard left 458 and 291 departures on 8 and 9 February, both badly
+delayed. `mean_of_days` counts each as a full day, so it runs up to 1.4
+minutes above `per_flight` for the next week. For a single statistic,
+`pl.col("delay").rolling_mean_by("date", "7d")` inside `with_columns()` gives
+`mean_of_days` and keeps the other columns.
+
+## See also {#sec-ts-see-also}
+
+- Cheatsheet:
+  [Dates & Times](../overview/polars-cheatsheet.qmd#sec-cs-datetime) ·
+  [Window & Ranking Functions](../overview/polars-cheatsheet.qmd#sec-cs-window)
+- Related: [Dates & Times](datetime.qmd) ·
+  [Window Functions](../transform/window.qmd#sec-win-rolling-time) ·
+  [Joins](../transform/joins.qmd#sec-join-asof) ·
+  [Missing Values](missing.qmd#sec-na-filling) ·
+  [Reshaping](../transform/reshape.qmd#sec-rs-complete)
+- Polars user guide:
+  [Grouping by time](https://docs.pola.rs/user-guide/transformations/time-series/rolling/) ·
+  [Resampling](https://docs.pola.rs/user-guide/transformations/time-series/resampling/)
+- Python API:
+  [`group_by_dynamic`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.group_by_dynamic.html) ·
+  [`rolling`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.rolling.html) ·
+  [`upsample`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.upsample.html)
+- R side: [slider](https://slider.r-lib.org/) ·
+  [tsibble](https://tsibble.tidyverts.org/) · R4DS 2e,
+  [Dates and times](https://r4ds.hadley.nz/datetimes.html)

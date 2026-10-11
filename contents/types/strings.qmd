@@ -1,0 +1,687 @@
+---
+title: "Strings & Regex"
+subtitle: "≈ stringr · R4DS strings & regular expressions"
+jupyter: python3
+---
+
+Every Polars string function lives in one namespace, `.str`, on an
+expression. The [cheatsheet](../overview/polars-cheatsheet.qmd#sec-cs-strings)
+maps stringr to it function by function; this chapter covers what a
+one-to-one table hides. The regex engine is a different one (Rust `regex`, not
+ICU), a pattern can differ per row, offsets come in two units, and Thai text
+shows that a "character" is not what you see. Splitting a string into columns
+is in [Reshaping](../transform/reshape.qmd#sec-rs-strings).
+
+## In tidyverse {#sec-str-tidyverse}
+
+```r
+library(tidyverse)
+
+x <- c("CT chest: 5 mm nodule", "MRI brain 3 T", "CT ช่องท้อง 2.5 ซม.")
+
+str_detect(x, "CT")                          # pattern = ICU regex by default
+str_detect(x, fixed("."))                    # fixed() / coll() / regex() modify it
+str_extract(x, "\\d+(?= mm)")                # look-ahead: ICU supports it
+str_extract(x, "(\\d+) mm", group = 1)       # or capture a group (stringr ≥ 1.5)
+str_replace(x, "(\\w+) (\\w+)", "\\2 \\1")   # back-references as \\1
+str_replace_all(x, c("CT" = "computed tomography", "MRI" = "magnetic resonance"))
+str_length("ท้อง")                           # 4: code points, not what you see
+str_sub(x, 1, 2)                             # 1-based, end inclusive
+```
+
+stringr vectorises over string *and* pattern, and the pattern is ICU regex
+unless wrapped. Polars keeps the vectorisation and swaps the engine: two ICU
+features are gone, `\\1` becomes `$1`, and lengths and offsets need a unit.
+
+## Mental model {#sec-str-model}
+
+```text
+ pl.col("report").str.contains( pattern , literal=False )
+ └──── Expr ────┘ └ns┘└ method ┘ └──┬──┘
+                                    ├── "CT|MRI"        one pattern, compiled once, used on every row
+                                    └── pl.col("pat")   one pattern per row (stringr's vectorised pattern)
+
+ a regex pattern ──► Rust `regex` crate: linear time, Unicode-aware by default,
+                                         no look-around, no back-references
+```
+
+The same `pattern` argument means different things to different methods:
+
+| The pattern is… | Methods | stringr analogue |
+|---|---|---|
+| a regex; `literal=True` opts out | `contains`, `find`, `count_matches`, `replace`, `replace_all` | default; `fixed()` |
+| always a regex | `extract`, `extract_all`, `extract_groups` | default |
+| literal; `literal=False` opts in | `split` | — |
+| always literal | `starts_with`, `ends_with`, `strip_prefix`, `strip_suffix` | `fixed()` |
+| a set of characters | `strip_chars`, `strip_chars_start`, `strip_chars_end` | — |
+| many literals at once (Aho-Corasick) | `contains_any`, `extract_many`, `find_many`, `replace_many` | `fixed()` + `|` |
+
+: How `.str` methods read their pattern {.striped}
+
+| | stringr (ICU) | Polars (Rust `regex`) |
+|---|---|---|
+| Look-ahead/behind `(?=…)`, `(?<=…)` | yes | parse error (@sec-str-engine) |
+| Back-reference `\1` inside a pattern | yes | parse error |
+| Group reference in a replacement | `\\1` | `$1`, `${name}`, `$0` (@sec-str-replace) |
+| Options | `regex(ignore_case =, multiline =, dotall =, comments =)` | inline flags `(?i)`, `(?m)`, `(?s)`, `(?x)` |
+| `\d`, `\w`, `\b` | Unicode | Unicode: `๑๒` is `\d` |
+| `[[:alpha:]]` | Unicode | **ASCII only** |
+| Positions | 1-based, end inclusive | 0-based `(offset, length)` |
+| Length unit | code points | code points (`len_chars`); `find` returns **bytes** |
+| Matching | backtracking | linear time in the input, no catastrophic patterns |
+
+: The engines side by side {.striped}
+
+## Mechanics {#sec-str-mechanics}
+
+```{python}
+#| include: false
+%xmode Minimal
+```
+
+```{python}
+import re
+
+import polars as pl
+from pl_notes import datasets
+
+pl.Config.set_fmt_str_lengths(60)          # show long strings in full
+pl.Config.set_fmt_table_cell_list_len(6)
+
+planes_df = datasets.planes()
+airports_df = datasets.airports()
+flights_df = datasets.flights()
+
+reports_df = pl.DataFrame({"report": [      # invented, report-like snippets
+    "CT chest: 5 mm nodule in RUL. No pneumothorax.",
+    "CXR: small left pleural effusion.",
+    "CXR: no effusion or pneumothorax.",
+    "MRI brain 3 T: no no acute infarct.",
+    "CT: Pneumothorax, large. Nodules 3 mm and 4.5 mm.",
+    "CT ช่องท้อง: ก้อนที่ตับ 2.5 ซม.",
+]})
+```
+
+### Patterns per row {#sec-str-per-row}
+
+Pass an expression as the pattern and each row gets its own. Which aircraft
+tail numbers end in their carrier's code?
+
+```{python}
+tails_df = flights_df.select("carrier", "tailnum").unique().drop_nulls()
+
+tails_df.group_by("carrier").agg(
+    n_planes=pl.len(),
+    ends_in_code=pl.col("tailnum").str.ends_with(pl.col("carrier")).mean().round(2),
+).sort("ends_in_code", "carrier", descending=[True, False]).head(6)
+```
+
+American (`N619AA`) always does; Southwest about half the time. Not every
+method takes a per-row pattern:
+
+| Per-row expression accepted | Not accepted (Polars 2.0) |
+|---|---|
+| `contains`, `find`, `count_matches`, `extract`, `extract_all`, `starts_with`, `ends_with`, `split`, `strip_prefix`, `strip_suffix`, `strip_chars` | `replace` / `replace_all` **pattern**: "dynamic pattern length … not supported yet" (the replacement *value* may vary) |
+| `extract_many`: a List column of keywords per row | `contains_any`: one list for all rows only ("not yet implemented") |
+| numbers: `head(n)`, `slice(offset, length)`, `pad_start(length)`, `to_integer(base=)` | `extract_groups`: a `str` only (`TypeError`) |
+
+: Verified on Polars 2.0.0 {.striped}
+
+To drop the code from `tailnum`, `replace(pl.col("carrier"), "")` fails, but
+`strip_suffix(pl.col("carrier"))` works. The string side must be a full
+column too: `pl.lit("text").str.extract_all(pl.col("pattern"))` fails with a
+length mismatch instead of broadcasting.
+
+### The regex engine {#sec-str-engine}
+
+The Rust `regex` crate guarantees matching in linear time. The price is two
+features it can't offer within that guarantee:
+
+```{python}
+#| error: true
+reports_df.select(pl.col("report").str.extract(r"\d+(?= mm)", 0))   # look-ahead
+```
+
+A back-reference such as `\b(\w+) \1\b` fails the same way, with "error:
+backreferences are not supported". Both errors come from the regex parser,
+not from the data. The workaround:
+match the context instead of looking at it, and capture the part you want.
+
+| ICU pattern | Without look-around or back-references |
+|---|---|
+| `\d+(?= mm)` | `extract(r"(\d+) mm", 1)` |
+| `pneumothorax` not preceded by `no` | `contains("pneumothorax") & ~contains(r"\bno\b[^.]*pneumothorax")` (recipe in @sec-str-recipes) |
+| `\b(\w+) \1\b` (doubled word) | split into words, compare each with the previous one |
+
+: Workarounds {.striped}
+
+```{python}
+reports_df.select(
+    "report",
+    size_mm=pl.col("report").str.extract(r"(\d+(?:\.\d+)?) mm", 1),
+    doubled_word=pl.col("report").str.to_lowercase().str.extract_all(r"\w+")
+        .list.eval(pl.element() == pl.element().shift(1)).list.any(),
+)
+```
+
+**Unicode classes.** Character classes are Unicode-aware by default. One
+mixed string against several classes (a per-row pattern again):
+
+```{python}
+classes_df = pl.DataFrame({
+    "pattern": [r"\d+", r"[0-9]+", r"\w+", r"\p{L}+", r"[[:alpha:]]+", r"\p{Thai}+", r"\p{Latin}+"]
+})
+
+classes_df.with_columns(text=pl.lit("CT ช่องท้อง ๑๒ mm, Ünal 7")).select(
+    "pattern", matches=pl.col("text").str.extract_all(pl.col("pattern"))
+)
+```
+
+- `\d` matches Thai digits (`๑๒`); `[0-9]` or `(?-u:\d)` is ASCII only.
+- `\p{L}` breaks Thai words apart: tone marks and above/below vowels are
+  marks (`\p{M}`), not letters. `\w` and `\p{Thai}` keep them.
+- `[[:alpha:]]` is ASCII only, so `Ünal` loses its `Ü` (ICU's is Unicode).
+- `\p{Thai}` is a script, so it includes Thai digits; `\X` (grapheme) is a
+  parse error.
+
+**Flags.** stringr's `regex()` options become inline flags at the start of
+the pattern, or scoped to a group with `(?i:…)`:
+
+| stringr | Polars | Effect |
+|---|---|---|
+| `regex(p, ignore_case = TRUE)` | `(?i)p` | Unicode case folding: `(?i)ünal` matches `ÜNAL` |
+| `regex(p, multiline = TRUE)` | `(?m)p` | `^` and `$` match at each line |
+| `regex(p, dotall = TRUE)` | `(?s)p` | `.` also matches `\n` |
+| `regex(p, comments = TRUE)` | `(?x)p` | whitespace and `# …` ignored; escape a space as `\ ` |
+
+: Options become flags {.striped}
+
+```{python}
+note_s = pl.Series(["FINDINGS:\nSmall nodule.\nIMPRESSION:\nNo acute finding."])
+
+{
+    "no flag": note_s.str.extract(r"FINDINGS:(.*)IMPRESSION", 1).item(),
+    "(?s)": note_s.str.extract(r"(?s)FINDINGS:\s*(.*?)\s*IMPRESSION", 1).item(),
+    "(?m)": note_s.str.extract_all(r"(?m)^[A-Z]+:").item().to_list(),
+    "(?xs)": note_s.str.extract(r"""(?xs)
+        IMPRESSION: \s*   # the heading
+        (.+)              # everything after it
+    """, 1).item(),
+}
+```
+
+Without `(?s)`, `.` stops at the newline and the match fails.
+
+### Detect {#sec-str-detect}
+
+Many keywords: `contains_any()` (Aho-Corasick, literal) or one regex
+alternation.
+
+```{python}
+findings = ["nodule", "effusion", "pneumothorax"]
+findings_re = r"(?i)\b(?:" + "|".join(map(re.escape, findings)) + ")"
+
+reports_df.select(
+    "report",
+    aho=pl.col("report").str.contains_any(findings, ascii_case_insensitive=True),
+    regex=pl.col("report").str.contains(findings_re),
+    which=pl.col("report").str.extract_many(findings, ascii_case_insensitive=True),
+)
+```
+
+| | `contains_any` / `extract_many` | `contains` with `a|b|c` |
+|---|---|---|
+| Patterns | literal strings | regex (escape with `re.escape()`, or `.str.escape_regex()` on a column) |
+| Case-insensitive | `ascii_case_insensitive=True`: **ASCII only** | `(?i)`: Unicode |
+| Word boundaries | none: `"CT"` matches inside `"CTA"` | `\b` |
+| Reports which keyword | `extract_many` | `extract_all` |
+
+: Many keywords {.striped}
+
+Overlapping keywords: by default the match that *ends* first wins, not the
+longest; `leftmost=True` takes the leftmost start, then the first-listed
+keyword:
+
+```{python}
+cta_s = pl.Series(["CTA chest"])
+
+{
+    "default": cta_s.str.extract_many(["CTA", "CT", "C"]).item().to_list(),
+    "leftmost=True": cta_s.str.extract_many(["CTA", "CT", "C"], leftmost=True).item().to_list(),
+}
+```
+
+Rule: list longer keywords first and pass `leftmost=True`. The same applies
+to `replace_many()`.
+
+For patterns typed by users, `contains(pattern, strict=False)` turns an
+invalid regex into null instead of an error.
+
+### Extract {#sec-str-extract}
+
+| stringr | Polars | Returns |
+|---|---|---|
+| `str_extract(x, p)` | `extract(p, 0)` | String, the whole match |
+| `str_extract(x, p, group = 1)` | `extract(p)`: group 1 is the **default** | String |
+| `str_extract_all(x, p)` | `extract_all(p)` | List(String), always whole matches |
+| `str_match(x, p)` | `extract_groups(p)` | Struct, one field per group, first match only |
+
+: Extracting {.striped}
+
+```{python}
+size_re = r"(\d+(?:\.\d+)?) ?(mm|cm|ซม)"
+
+reports_df.select(
+    "report",
+    group1=pl.col("report").str.extract(size_re),
+    whole=pl.col("report").str.extract(size_re, 0),
+    every=pl.col("report").str.extract_all(size_re),
+    no_group=pl.col("report").str.extract(r"\d+ mm"),   # group 1 doesn't exist → null
+)
+```
+
+`no_group` is all null and nothing warns: with the default `group_index=1`,
+a pattern without a group extracts nothing. A group number that doesn't exist
+does the same.
+
+`extract_groups()` names fields after named groups, `(?<name>…)` or
+`(?P<name>…)`; unnamed groups become `"1"`, `"2"`, …; `unnest()` makes them
+columns (recipe in @sec-str-recipes; more in
+[Reshaping](../transform/reshape.qmd#sec-rs-names)).
+
+Every match of a group (≈ `str_match_all()`): extract all whole matches, then
+run an expression on each list element with `list.eval()` (see
+[Nested Data](nested.qmd)):
+
+```{python}
+reports_df.select(
+    "report",
+    sizes_mm=pl.col("report").str.extract_all(r"\d+(?:\.\d+)? mm")
+        .list.eval(pl.element().str.extract(r"([\d.]+)").cast(pl.Float64)),
+)
+```
+
+### Replace {#sec-str-replace}
+
+The replacement string uses `$`, not `\`:
+
+```{python}
+dates_s = pl.Series(["2025-03-14"])
+iso_re = r"(?<y>\d{4})-(?<m>\d{2})-(?<d>\d{2})"
+
+{
+    "$3/$2/$1": dates_s.str.replace(iso_re, "$3/$2/$1").item(),
+    "${d}.${m}.${y}": dates_s.str.replace(iso_re, "${d}.${m}.${y}").item(),
+    "<$0>": dates_s.str.replace(r"\d+", "<$0>").item(),
+    r"\3/\2/\1": dates_s.str.replace(iso_re, r"\3/\2/\1").item(),
+    "$1x": dates_s.str.replace(iso_re, "$1x").item(),
+    "${1}x": dates_s.str.replace(iso_re, "${1}x").item(),
+    "US$$": dates_s.str.replace(iso_re, "US$$").item(),
+}
+```
+
+- `\3` is not a reference: it is inserted literally.
+- `$1x` refers to a group named `1x`, which doesn't exist, so it inserts
+  nothing. Use braces: `${1}x`.
+- A literal `$` is `$$`, or pass `literal=True`, which turns off `$`
+  expansion as well as the regex. A replacement taken from a column
+  (`pl.col("value")`) is expanded too.
+
+`replace()` replaces the first match and `replace_all()` every match, as in
+stringr. `n=` replaces the first *n*, but only for a literal pattern
+(`replace(".", "-", literal=True, n=2)` turns `1.2.3.4` into `1-2-3.4`):
+
+```{python}
+#| error: true
+pl.Series(["1 2 3 4"]).str.replace(r"\d", "#", n=2)
+```
+
+**`replace_many()`** ≈ `str_replace_all()` with a named vector, with three
+differences: patterns are literal, all of them are applied in **one pass**,
+and a single replacement must still be a list:
+
+```{python}
+exam_s = pl.Series(["CT and MRI"])
+
+{
+    "mapping (swap)": exam_s.str.replace_many({"CT": "MRI", "MRI": "CT"}).item(),
+    "many → one": exam_s.str.replace_many(["CT", "MRI"], ["<scan>"]).item(),
+}
+```
+
+stringr applies a named vector in turn, so
+`str_replace_all("CT and MRI", c(CT = "MRI", MRI = "CT"))` gives
+`"CT and CT"`. One pass makes the swap work. A bare string as the
+replacement (`replace_many(["CT", "MRI"], "<scan>")`) raises "Use `implode`
+to wrap the string value into a list"; and a bare string as the *patterns*
+argument is read as a column name (@sec-str-gotchas).
+
+### Length and Unicode {#sec-str-unicode}
+
+```{python}
+organs_df = pl.DataFrame({"word": ["ปอด", "ท้อง", "น้ำ", "กระดูกสันหลัง", "lung", "café"]})
+
+organs_df.with_columns(
+    chars=pl.col("word").str.len_chars(),
+    bytes=pl.col("word").str.len_bytes(),
+    head2=pl.col("word").str.head(2),
+    slice_1_1=pl.col("word").str.slice(1, 1),
+    reversed=pl.col("word").str.reverse(),
+)
+```
+
+```text
+ ท้อง  =  ท       ◌้        อ       ง          len_chars() = 4  (code points; = str_length())
+         U+0E17  U+0E49    U+0E2D  U+0E07     len_bytes() = 12 (3 bytes each in UTF-8)
+         letter  mark (Mn) letter  letter     what you see = 3 cells
+```
+
+- `len_chars()` counts code points, like `str_length()`, so a tone mark or
+  above/below vowel counts as a character.
+- `head()`, `tail()` and `slice()` cut between code points: `slice(1, 1)` of
+  `ท้อง` is a lone tone mark; `head(2)` of `น้ำ` drops the final vowel.
+- `reverse()` is the exception: it keeps a base character and its marks
+  together (`งอท้`, where a code-point reversal gives `งอ้ท`).
+- Polars has no grapheme-cluster length (`\X` is not supported). The number
+  of visible cells is close to `len_chars() - count_matches(r"\p{Mn}")`.
+
+**`find()` returns a byte offset**, while `slice()` takes characters. On
+ASCII the two agree; on Thai they don't:
+
+```{python}
+pl.DataFrame({"s": ["CT chest 5 mm", "CT ช่องท้อง 5 mm"]}).with_columns(
+    at=pl.col("s").str.find(r"\d"),
+    sliced=pl.col("s").str.slice(pl.col("s").str.find(r"\d")),   # wrong on Thai
+    extracted=pl.col("s").str.extract(r"(\d.*)", 1),             # right
+)
+```
+
+`find_many()` returns bytes too. To cut at a pattern, extract or split with a
+regex instead of computing an offset.
+
+**Normalization.** One visible string can have several encodings, and they
+compare unequal. Two spellings each of `café` and Thai `คำ`:
+
+```{python}
+variants_df = pl.DataFrame({"term": ["caf\u00e9", "cafe\u0301", "ค\u0e33", "ค\u0e4d\u0e32"]})
+
+variants_df.select(
+    distinct_raw=pl.col("term").n_unique(),
+    distinct_nfc=pl.col("term").str.normalize("NFC").n_unique(),
+    distinct_nfkc=pl.col("term").str.normalize("NFKC").n_unique(),
+)
+```
+
+`é` precomposed (U+00E9) and `e` + combining acute (U+0301) become one under
+NFC. Thai SARA AM (`ำ`, U+0E33) and NIKHAHIT + SARA AA (`ํ` + `า`), a common
+typing variant of the same vowel, become one only under NFKC, because SARA
+AM's decomposition is a compatibility one. Normalize the patterns as well:
+after NFKC, a literal `"คำ"` typed in Python no longer matches the column
+(`unicodedata.normalize("NFKC", "คำ")` does).
+
+**Case.**
+
+```{python}
+pl.DataFrame({"s": ["straße", "mri ของ สมอง", "x-ray of l1", "ct3d DICOM-RT", "o'neil mcdonald"]}).with_columns(
+    upper=pl.col("s").str.to_uppercase(),
+    title=pl.col("s").str.to_titlecase(),
+)
+```
+
+Case mapping is full Unicode (`ß` → `SS`, so the length changes) and Thai,
+which has no case, passes through. `to_titlecase()` starts a new word after
+any character that is not a letter, so digits, hyphens and apostrophes
+restart capitalisation (`Ct3D`, `Dicom-Rt`, `O'Neil`), and acronyms are
+lowercased.
+
+### Shaping {#sec-str-shaping}
+
+**Strip.** `strip_chars()` takes a *set* of characters and removes any of
+them from both ends; `strip_prefix()` / `strip_suffix()` remove one literal
+string, once:
+
+```{python}
+pl.DataFrame({"s": ["CTCT scan CT", "\u00a0 CT chest \t", "007", "000"]}).with_columns(
+    chars_CT=pl.col("s").str.strip_chars("CT"),
+    prefix_CT=pl.col("s").str.strip_prefix("CT"),
+    whitespace=pl.col("s").str.strip_chars(),          # any Unicode whitespace, incl. NBSP
+    zeros=pl.col("s").str.strip_chars_start("0"),      # "000" → ""
+)
+```
+
+**Pad.** Padding counts characters (code points) and takes a single fill
+character; `zfill()` knows about signs:
+
+```{python}
+pl.DataFrame({"s": ["7", "-7", "12345", "ปอด"]}).with_columns(
+    pad_start=pl.col("s").str.pad_start(4, "0"),
+    zfill=pl.col("s").str.zfill(4),
+    pad_end=pl.col("s").str.pad_end(4, "."),
+)
+```
+
+**Slice.** 0-based `(offset, length)`: `str_sub(s, 3, 5)` is `slice(2, 3)`.
+A negative `n` means "all but": `head(-2)` ≈ `str_sub(s, 1, -3)` and
+`tail(-2)` ≈ `str_sub(s, 3)`. An offset past the end gives `""`; a negative
+`length` in `slice()` is an error.
+
+**Interpolate.** `pl.format()` accepts glue-style named placeholders, which
+refer to columns directly, as well as `{}` (next argument) and `{0}` (by
+position):
+
+```{python}
+exams_df = pl.DataFrame({"modality": ["CT", "MRI", None], "region": ["chest", "brain", "knee"], "slice_mm": [5.0, 1.25, 3.0]})
+
+exams_df.select(
+    named=pl.format("{modality} {region}, {slice_mm} mm"),
+    positional=pl.format("{} ({})", "region", "modality"),
+)
+```
+
+Unlike glue, a placeholder is a column name only: no expressions, no format
+specs (`{:.2f}` fails with "unacceptable column name"), and the name must be
+an ASCII identifier. A null input gives a null row, as with `pl.concat_str()`
+(see [Missing Values](missing.qmd#sec-na-propagation)).
+
+**Numbers ↔ strings.** Parsing is strict and literal: no surrounding spaces,
+no thousands separators, no Thai digits:
+
+```{python}
+thai_digits = dict(zip("๐๑๒๓๔๕๖๗๘๙", "0123456789"))
+
+pl.DataFrame({"s": ["42", " 7", "1,234", "3.5", "๑๒", "ff"]}).with_columns(
+    int=pl.col("s").str.to_integer(strict=False),
+    float=pl.col("s").cast(pl.Float64, strict=False),
+    cleaned=pl.col("s").str.strip_chars().str.replace_all(",", "", literal=True)
+        .str.replace_many(thai_digits).str.to_integer(strict=False),
+    hex=pl.col("s").str.to_integer(base=16, strict=False),
+)
+```
+
+With `strict=True` (the default) any bad value raises an error. `base=`
+also accepts an expression, and `"0x1A"` with `base=16` fails: prefixes are
+not stripped. Going the other way there is no `sprintf()`: casting a float
+to `String` drops trailing zeros. Casting through `Decimal` fixes the number
+of decimals:
+
+```{python}
+pl.DataFrame({"x": [3.14159, 2.0, 0.1 + 0.2]}).with_columns(
+    plain=pl.col("x").cast(pl.String),
+    rounded=pl.col("x").round(2).cast(pl.String),
+    fixed2=pl.col("x").cast(pl.Decimal(scale=2)).cast(pl.String),
+)
+```
+
+## Where it bites {#sec-str-gotchas}
+
+| stringr habit | Polars 2.0 | Fix |
+|---|---|---|
+| a `"."` meant literally | `contains(".")` is a regex: matches every non-empty string | `literal=True` |
+| `str_extract(x, p)` gives the match | `extract(p)` gives group 1, so null without a group | `extract(p, 0)` |
+| `\\1` in a replacement | `\1` is inserted literally; `$1x` is a group named `1x` | `$1`, `${1}x` |
+| `str_replace_all()` with a named vector | `replace_many()` matches substrings, not words | regex with `\b` |
+| look-around, back-references | parse error | capture groups (@sec-str-engine) |
+| `str_sub()` is 1-based | 0-based `(offset, length)` | |
+| `str_locate()` gives character positions | `find()` gives byte offsets | `extract()` |
+| `[[:alpha:]]` is Unicode | ASCII only | `\p{L}`, `\w`, `\p{Thai}` |
+| `\b` around a Thai word | Thai has no spaces between words | no `\b` in Thai text |
+| `str_length(a) - str_length(b)` can be negative | `UInt32` wraps: `ปอด` − `ท้อง` = 4294967295 ([Data Model](../core/data-model.qmd#sec-dm-unsigned)) | cast to `Int64` first |
+| a string argument is a value | `contains_any("x")` reads `"x"` as a column | pass a list |
+| stringr works on factors | `.str` on a `Categorical` raises "expected String type, got: cat" ([Categorical & Enum](categorical.qmd)) | `cast(pl.String)` |
+
+: The differences at a glance {.striped}
+
+### `"."` matches everything {#sec-str-dot}
+
+```{python}
+pl.Series(["v1.2", "v102", "v1-2"]).str.contains("1.2").to_list()
+```
+
+### `replace_many()` has no word boundaries {#sec-str-substrings}
+
+Expanding the abbreviations in `airports.name` (`Intl`, `Rgnl`, `Muni`, …)
+with `replace_many()` also rewrites every word that *contains* one:
+
+```{python}
+abbreviations = {"Intl": "International", "Rgnl": "Regional", "Muni": "Municipal", "Fld": "Field", "Co": "County"}
+
+name_expanded = pl.col("name")
+for short, full in abbreviations.items():
+    name_expanded = name_expanded.str.replace_all(rf"\b{short}\b", full)
+
+airports_df_damaged = airports_df.select(
+    "faa", "name",
+    aho=pl.col("name").str.replace_many(abbreviations),
+    regex=name_expanded,
+).filter(pl.col("aho") != pl.col("regex"))
+
+print(airports_df_damaged.height, "names damaged")
+airports_df_damaged.sort("faa").select("faa", "aho", "regex").head(3)
+```
+
+`replace_all()` takes one pattern, so the regex fix chains one call per
+abbreviation (built in a loop, see
+[Expressions](../core/expressions.qmd#sec-expr-recipes)).
+
+### `\b` and Thai {#sec-str-thai-boundary}
+
+`\w` includes Thai letters and Thai is written without spaces, so a Thai word
+is almost never between two word boundaries:
+
+```{python}
+lung_s = pl.Series(["ปอดอักเสบ", "ไม่พบความผิดปกติของปอด", "ปอด ปกติ"])
+
+{
+    r"\bปอด\b": lung_s.str.contains(r"\bปอด\b").to_list(),
+    "ปอด": lung_s.str.contains("ปอด").to_list(),
+}
+```
+
+Substring search over-matches instead (`ปอด` "lung" is inside many longer
+words). Precise Thai matching needs word segmentation, which Polars doesn't do.
+
+### Strings that are column names {#sec-str-colname}
+
+```{python}
+#| error: true
+reports_df.select(pl.col("report").str.contains_any("effusion"))
+```
+
+`contains_any()`, `extract_many()` and `replace_many()` take their patterns
+as expression input, so a bare string is a column (the rule in
+[Expressions](../core/expressions.qmd#sec-expr-literals)). A list is a value.
+
+## Recipes {#sec-str-recipes}
+
+**Collapse manufacturer variants** in `planes` (`AIRBUS` vs `AIRBUS
+INDUSTRIE`). One anchored regex removes any run of company suffixes; list
+longer alternatives before their prefixes:
+
+```{python}
+suffix_re = r"(?: (?:INDUSTRIE|AIRCRAFT CO|CORPORATION|CORP|INC|LTD|CO))+$"
+
+planes_df_clean = planes_df.with_columns(maker=pl.col("manufacturer").str.replace(suffix_re, ""))
+print(planes_df["manufacturer"].n_unique(), "→", planes_df_clean["maker"].n_unique())
+
+with pl.Config(fmt_str_lengths=90, tbl_width_chars=120):
+    print(
+        planes_df_clean.group_by("maker").agg(
+            n=pl.len(),
+            variants=pl.col("manufacturer").unique().sort().str.join(" | "),
+        ).filter(pl.col("variants").str.contains("|", literal=True)).sort("maker")
+    )
+```
+
+Three makers absorb seven spellings. The `$` anchor is not decorative: without
+it, `" CO"` cuts into any word that starts with `CO` (`"ACME COMPANY CO"`
+→ `"ACMEMPANY CO"`).
+
+**A number with its unit, from free text in two languages.** Translate Thai
+digits first, then capture value and unit, then convert:
+
+```{python}
+findings_df = pl.DataFrame({"finding": [
+    "CT chest: 5 mm slices",
+    "Nodule 0.6cm in RUL",
+    "Thyroid nodule 12.5 mm, TI-RADS 3",
+    "ก้อนที่ตับ ขนาด ๑.๕ ซม.",
+    "No measurable lesion",
+]})
+mm_per_unit = {"mm": 1, "มม": 1, "cm": 10, "ซม": 10}
+
+findings_df.with_columns(
+    size=pl.col("finding").str.replace_many(thai_digits)
+        .str.extract_groups(r"(?<value>\d+(?:\.\d+)?)\s*(?<unit>mm|cm|มม|ซม)")
+).unnest("size").with_columns(
+    size_mm=pl.col("value").cast(pl.Float64) * pl.col("unit").replace_strict(mm_per_unit),
+)
+```
+
+**Detect findings, excluding negated ones.** A finding counts if it is
+mentioned and no `no` precedes it in the same sentence. Without look-behind,
+the negation is a second pattern that includes its context:
+
+```{python}
+reports_df.with_columns(**{
+    finding: pl.col("report").str.contains(rf"(?i)\b{finding}")
+    & ~pl.col("report").str.contains(rf"(?i)\bno\b[^.]*\b{finding}")
+    for finding in findings
+})
+```
+
+`No pneumothorax.` after a nodule and `no effusion or pneumothorax` are both
+excluded; `Nodules` counts because the pattern has no closing `\b`. Real
+negation detection (NegEx-style) needs more rules than this.
+
+**Split Thai and English parts** of a bilingual label: two extractions by
+script, rejoined:
+
+```{python}
+labels_df = pl.DataFrame({"label": [
+    "ปอดอักเสบ Pneumonia",
+    "Pleural effusion น้ำในช่องเยื่อหุ้มปอด",
+    "CT ช่องท้อง (abdomen)",
+]})
+
+labels_df.with_columns(
+    thai=pl.col("label").str.extract_all(r"\p{Thai}+(?:\s+\p{Thai}+)*").list.join(" "),
+    english=pl.col("label").str.extract_all(r"\p{Latin}+(?:\s+\p{Latin}+)*").list.join(" "),
+)
+```
+
+`\p{Thai}` also matches Thai digits; use `[\p{Thai}--\p{Nd}]` (class
+subtraction) to leave them out.
+
+## See also {#sec-str-see-also}
+
+- Cheatsheet: [Strings](../overview/polars-cheatsheet.qmd#sec-cs-strings) ·
+  [Reshape](../overview/polars-cheatsheet.qmd#sec-cs-reshape)
+- Related: [Reshaping](../transform/reshape.qmd#sec-rs-strings) (split and
+  unite) · [Missing Values](missing.qmd#sec-na-propagation) (nulls in
+  `concat_str` and `format`) · [Dates, Times & Durations](datetime.qmd#sec-dt-parse)
+  (parsing strings) · [Nested Data](nested.qmd) (`list.eval`) ·
+  [Categorical & Enum](categorical.qmd)
+- Python API: [String namespace](https://docs.pola.rs/api/python/stable/reference/expressions/string.html)
+- Rust regex: [syntax reference](https://docs.rs/regex/latest/regex/#syntax)
+- R4DS 2e: [Strings](https://r4ds.hadley.nz/strings.html) ·
+  [Regular expressions](https://r4ds.hadley.nz/regexps.html)
